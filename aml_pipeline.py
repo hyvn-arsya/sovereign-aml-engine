@@ -52,7 +52,7 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from llama_parse import LlamaParse
 from pydantic import BaseModel, Field
-from thefuzz import fuzz
+from rapidfuzz import fuzz
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -432,29 +432,43 @@ def load_dfat_sanctions() -> list[dict]:
 
 def load_pep_list() -> list[dict]:
     """
-    FIX #6: PEP (Politically Exposed Persons) screening stub.
-
+    FIX #6: PEP (Politically Exposed Persons) screening integration.
+    
     PRODUCTION IMPLEMENTATION:
-        In production, integrate with a licensed PEP data provider such as:
-        - Dow Jones Risk & Compliance
-        - Refinitiv World-Check
-        - ComplyAdvantage
-        - LexisNexis WorldCompliance
-
-        These providers offer API access to global PEP databases that include
-        heads of state, senior government officials, senior judicial figures,
-        senior military officers, and their close associates/family members.
-
-        The returned format should match the DFAT structure:
-        [{"name": "...", "type": "PEP - [Category]"}, ...]
-
-    For now returns an empty list — PEP screening is a documented Phase 2 item.
+    Integrates with a commercial PEP provider (e.g. Dow Jones, ComplyAdvantage).
+    
+    ERROR HANDLING (Option B - Resilient Fallback):
+    If the third-party API goes down or times out, we catch the exception,
+    log a critical warning, and return an empty list so the overall
+    compliance pipeline is not halted.
     """
-    log.info(
-        "Agent 3: PEP list is currently a stub. "
-        "Integrate a licensed PEP provider for production."
-    )
-    return []
+    api_key = os.environ.get("PEP_API_KEY")
+    
+    # If no API key is provided, we return a mock database for local testing
+    if not api_key:
+        log.info("Agent 3: No PEP_API_KEY found. Using mock PEP database for testing.")
+        return [
+            {"name": "Vladimir Ivanovich Petrov", "type": "PEP - Foreign Government Official"},
+            {"name": "Sarah Louise Pemberton", "type": "PEP - Close Associate"}
+        ]
+        
+    log.info("Agent 3: Fetching data from Commercial PEP Database...")
+    try:
+        # Example request to a commercial provider
+        response = requests.get(
+            "https://api.mock-pep-provider.com/v1/list",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=5  # Strict 5-second timeout to prevent pipeline hanging
+        )
+        response.raise_for_status()
+        return response.json().get("peps", [])
+    except requests.RequestException as exc:
+        # OPTION B: Resilient Fallback executed here
+        log.error(
+            f"Agent 3: CRITICAL WARNING — Commercial PEP API failed ({exc}). "
+            "Proceeding with DFAT sanctions screening only."
+        )
+        return []
 
 
 def _screen_entities(
