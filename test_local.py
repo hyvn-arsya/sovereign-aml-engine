@@ -3,6 +3,13 @@ Local Pipeline Test v2 -- Bypasses S3, reads PDF from disk.
 Uses pymupdf4llm for local PDF parsing (no LlamaParse API needed).
 Tests Agent 2 (extraction) -> Agent 3 (Screening) -> Agent 4 (Report)
 
+> NOTE: This is a DEVELOPMENT-ONLY script and is NOT the canonical
+> extraction path. The production path is the chunk-and-merge pipeline in
+> ``aml_pipeline.extract_trust_deed`` (LlamaParse + Gemini), which guarantees
+> every page of a large trust deed is processed (see the rationale in
+> ``aml_pipeline.py``). This script uses a single-pass prompt with a local
+> parser mainly to exercise Agents 3 and 4 offline.
+
 Usage:
     1. Set your API keys:
         $env:OPENAI_API_KEY = "your-key"
@@ -13,6 +20,8 @@ Usage:
 
     3. Or run with just Agent 3+4 (no API keys needed) using mock extraction:
         python test_local.py --mock-only
+
+Dev dependency (not in requirements.txt): pip install pymupdf4llm
 """
 
 import json

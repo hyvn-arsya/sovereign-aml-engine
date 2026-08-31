@@ -1,0 +1,3 @@
+# Dev/test dependencies for the sovereign-aml project root.
+pytest>=8.0
+pymupdf4llm>=0.0.17

@@ -1,6 +1,7 @@
 # Environment Variables
 .env
 .venv
+.venv*/
 env/
 venv/
 ENV/
@@ -54,5 +55,11 @@ node_modules/
 !infrastructure/source.bat
 !infrastructure/.gitignore
 
+# Keep root Python dependency manifests
+!requirements.txt
+!requirements-dev.txt
+
 # Portfolio documentation
 !README.md
+!docs/*
+!docs/**

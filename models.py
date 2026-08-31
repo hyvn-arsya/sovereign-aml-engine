@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Float, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Float, DateTime, Text
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
@@ -54,3 +54,18 @@ class ComplianceReport(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     trust = relationship("Trust", back_populates="reports")
+
+
+class AnalysisJob(Base):
+    """Async screening job (Phase 3+: maps to an SQS/Fargate worker)."""
+
+    __tablename__ = "analysis_jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String, unique=True, index=True)
+    abn = Column(String, index=True, nullable=False)
+    status = Column(String, index=True, default="queued")  # queued|running|completed|failed
+    compliance_memo = Column(Text, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)

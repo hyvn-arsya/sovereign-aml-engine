@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from aws_cdk import (
     Stack,
     RemovalPolicy,
@@ -14,13 +16,28 @@ from aws_cdk import (
 )
 from constructs import Construct
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
 
 class InfrastructureStack(Stack):
 
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        container_image: ecs.ContainerImage | None = None,
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         env = self.node.try_get_context("env") or "dev"
+
+        if container_image is None:
+            container_image = ecs.ContainerImage.from_asset(
+                str(PROJECT_ROOT),
+                file="Dockerfile",
+            )
 
         # --- S3 Buckets ---
 
@@ -115,10 +132,7 @@ class InfrastructureStack(Stack):
                 rollback=True,
             ),
             task_image_options=ecs_patterns.ApplicationLoadBalancedTaskImageOptions(
-                image=ecs.ContainerImage.from_asset(
-                    "..",
-                    file="Dockerfile",
-                ),
+                image=container_image,
                 container_port=8000,
                 environment={
                     "ENV": env,

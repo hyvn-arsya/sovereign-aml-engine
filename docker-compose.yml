@@ -12,6 +12,32 @@ services:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sovereign_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sovereign_app
+    environment:
+      DB_HOST: postgres_db
+      DB_USER: postgres
+      DB_PASS: postgres123
+      DB_NAME: sovereign_db
+      # Optional: pass through any keys present in the shell env / .env
+      LLAMACLOUD_API_KEY: ${LLAMACLOUD_API_KEY:-}
+      GOOGLE_API_KEY: ${GOOGLE_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres_db:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
