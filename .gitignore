@@ -36,3 +36,20 @@ wheels/
 *.md
 *.json
 *.txt
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# CDK build output
+cdk.out
+.cdk.staging
+node_modules/
+
+# Keep infrastructure CDK config (re-include needed config files)
+!infrastructure/cdk.json
+!infrastructure/requirements.txt
+!infrastructure/requirements-dev.txt
+!infrastructure/source.bat
+!infrastructure/.gitignore

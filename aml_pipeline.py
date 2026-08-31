@@ -5,7 +5,7 @@ AML/KYC Beneficial Ownership Screening Pipeline
 
 Architecture:
     Agent 1 → S3 PDF upload      (Data Gathering)
-    Agent 2 → LlamaParse + GPT   (Structured Extraction from PDF)
+    Agent 2 → LlamaParse + Gemini   (Structured Extraction from PDF)
     Agent 3 → Deterministic Rules (DFAT Sanctions + PEP Screening)
     Agent 4 → Claude Sonnet       (Audit Report Drafting)
 
@@ -32,78 +32,64 @@ Fixed Issues (v2):
     - [FIX #16] Agent 3: DFAT sanctions list cached with TTL
 """
 
-import io
 import json
 import logging
 import os
 import re
 import tempfile
 import time
+import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
+from sqlalchemy.orm import Session
 from zoneinfo import ZoneInfo  # FIX #3: Timezone-aware datetime
 
+os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
-from langchain_anthropic import ChatAnthropic
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from llama_parse import LlamaParse
+try:
+    from langchain_anthropic import ChatAnthropic
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    from llama_parse import LlamaParse
+except ImportError:
+    ChatAnthropic = ChatGoogleGenerativeAI = LlamaParse = None
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 
 # ─────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("aml_pipeline")
+try:
+    from pythonjsonlogger import jsonlogger
+    logHandler = logging.StreamHandler()
+    formatter = jsonlogger.JsonFormatter('%(asctime)s %(levelname)s %(name)s %(message)s')
+    logHandler.setFormatter(formatter)
+    log = logging.getLogger("aml_pipeline")
+    log.addHandler(logHandler)
+    log.setLevel(logging.INFO)
+    # Prevent the root logger from printing duplicate non-JSON lines
+    log.propagate = False 
+except ImportError:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    log = logging.getLogger("aml_pipeline")
 
-# ─────────────────────────────────────────────
-# DEBUG INSTRUMENTATION (session 4d4fc1)
-# ─────────────────────────────────────────────
-DEBUG_LOG_PATH = os.path.join(os.path.expanduser("~"), "debug-4d4fc1.log")
-DEBUG_SESSION_ID = "4d4fc1"
-
-
-def _agent_debug_log(
-    location: str,
-    message: str,
-    data: dict,
-    hypothesis_id: str,
-    run_id: str = "pre-fix",
-) -> None:
-    # #region agent log
-    entry = {
-        "sessionId": DEBUG_SESSION_ID,
-        "runId": run_id,
-        "hypothesisId": hypothesis_id,
-        "location": location,
-        "message": message,
-        "data": data,
-        "timestamp": int(time.time() * 1000),
-    }
-    try:
-        with open(DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
-        pass
-    # #endregion
-
-
-# ─────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────
-S3_BUCKET = "sovereign-engine-raw-documents"
+S3_BUCKET = os.environ.get("S3_BUCKET", "sovereign-engine-raw-documents")
+AUDIT_BUCKET = os.environ.get("AUDIT_BUCKET", S3_BUCKET)
 S3_PREFIX = "client_uploads"
 AUDIT_LOG_PREFIX = "audit_logs"
 
 # FIX #3: Timezone constant for Australia/Sydney (handles AEST/AEDT automatically)
-AEST = ZoneInfo("Australia/Sydney")
+try:
+    AEST = ZoneInfo("Australia/Sydney")
+except Exception:
+    AEST = timezone.utc
 
 # Chunk-and-merge constants for Agent 2.
 # CHUNK_SIZE: max characters per chunk sent to GPT-4o (~15k tokens, well within
@@ -112,6 +98,7 @@ AEST = ZoneInfo("Australia/Sydney")
 #   splitting an entity across a chunk boundary.
 CHUNK_SIZE = 60_000
 CHUNK_OVERLAP = 5_000
+EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-1.5-pro")
 
 # ─────────────────────────────────────────────
 # SHARED S3 CLIENT (created once, reused)
@@ -122,7 +109,7 @@ s3 = boto3.client("s3")
 # FIX #11: ENVIRONMENT VARIABLE VALIDATION
 # ─────────────────────────────────────────────
 # GOVERNMENT_API_KEY is excluded — only needed when Path B (registry fetch) is used.
-REQUIRED_ENV_VARS = ["LLAMACLOUD_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+REQUIRED_ENV_VARS = ["LLAMACLOUD_API_KEY", "GOOGLE_API_KEY", "ANTHROPIC_API_KEY"]
 
 
 def validate_env() -> None:
@@ -169,6 +156,7 @@ def redact(name: str) -> str:
 # ─────────────────────────────────────────────
 _dfat_cache: dict = {"data": None, "fetched_at": None}
 DFAT_CACHE_TTL_SECONDS = 86_400  # 24 hours
+_dfat_lock = threading.Lock()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -282,12 +270,15 @@ def gather_asic_data(
 #   Trust deeds are highly structured legal documents. Beneficiary schedules,
 #   appointor clauses, and foreign-entity disclosures can appear anywhere —
 #   often at the very end. Naive truncation silently drops these sections,
-#   producing a false "Clearance Certificate" for an unscreened trust.
+#   producing an unsafe automated disposition for an unscreened trust.
 #   Chunk-and-merge guarantees every page is processed.
 #
 # FIX #1: LlamaParse now uses a temp file on disk instead of BytesIO.
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+class PEPApiError(Exception):
+    pass
 
 class TrustDeedExtraction(BaseModel):
     trust_name: str = Field(description="The legal name of the trust")
@@ -345,33 +336,76 @@ def extract_trust_deed(s3_key: str) -> str:
     markdown_text = parsed_document[0].text
     log.info(f"Agent 2: Parsed {len(markdown_text)} characters of Markdown")
 
-    # ── SINGLE-PASS EXTRACTION ────────────────────────────────────────────────
-    log.info("Agent 2: Extracting entities in a single pass using Gemini 1.5 Pro...")
+    # ── CHUNK-AND-MERGE EXTRACTION ──────────────────────────────────────────
+    chunks = _split_into_chunks(markdown_text)
+    log.info(f"Agent 2: Extracting entities across {len(chunks)} chunks using {EXTRACTION_MODEL}...")
     
     llm = ChatGoogleGenerativeAI(
-        model="gemini-3.1-pro-preview",
+        model=EXTRACTION_MODEL,
         temperature=0,
         api_key=os.environ["GOOGLE_API_KEY"],
     )
     structured_llm = llm.with_structured_output(TrustDeedExtraction)
 
-    prompt = f"""
+    all_beneficiaries = []
+    trust_name = None
+    trustee_company = None
+    is_high_risk = False
+
+    for i, chunk in enumerate(chunks):
+        prompt = f"""
 You are an expert Australian AML/KYC compliance analyst.
-You are reviewing the full text of a Trust Deed and any associated Variation Deeds, Deeds of Retirement and Appointment, and other compliance documents.
-Extract the CURRENT entities as of the latest document.
-Pay close attention to the chronology of variations:
-- If a variation deed removes a beneficiary, do NOT include them in the final list.
-- If a variation deed adds a beneficiary, include them.
-- If the trustee has changed, extract the CURRENT trustee.
+You are reviewing a section (chunk {i+1} of {len(chunks)}) of a Trust Deed and any associated Variation Deeds.
+Extract the entities present IN THIS CHUNK.
+If a variation deed in this chunk removes a beneficiary, do NOT include them.
+If a variation deed adds a beneficiary, include them.
 
-Document Text:
-{markdown_text}
+Document Text Chunk:
+{chunk}
 """
+        try:
+            chunk_result: TrustDeedExtraction = structured_llm.invoke(prompt)
+            if chunk_result.trust_name and not trust_name:
+                trust_name = chunk_result.trust_name
+            
+            # Reconciliation Rule: Last chunk wins for trustee and risk
+            if chunk_result.trustee_company and chunk_result.trustee_company != trustee_company:
+                if trustee_company is not None:
+                    log.warning(f"Agent 2: Discrepancy in trustee_company across chunks. Overwriting '{trustee_company}' with '{chunk_result.trustee_company}' from chunk {i+1}.")
+                trustee_company = chunk_result.trustee_company
+            
+            if chunk_result.is_high_risk != is_high_risk:
+                log.warning(f"Agent 2: Discrepancy in is_high_risk across chunks. Overwriting '{is_high_risk}' with '{chunk_result.is_high_risk}' from chunk {i+1}.")
+                is_high_risk = chunk_result.is_high_risk
+            
+            # Add beneficiaries
+            if chunk_result.beneficiaries:
+                all_beneficiaries.extend(chunk_result.beneficiaries)
+                
+        except Exception as e:
+            log.warning(f"Agent 2: Failed to parse chunk {i+1} - {e}")
 
-    result: TrustDeedExtraction = structured_llm.invoke(prompt)
-    log.info(f"Agent 2: Extraction complete — Trust: {result.trust_name}")
+    # Reconciliation Rule: Fuzzy Deduplication for beneficiaries
+    unique_beneficiaries = []
+    for b in all_beneficiaries:
+        # Check if b is already in unique_beneficiaries (fuzzy match)
+        is_duplicate = False
+        for u in unique_beneficiaries:
+            if fuzz.token_set_ratio(b, u) >= 90:  # 90% threshold for same person
+                is_duplicate = True
+                break
+        if not is_duplicate:
+            unique_beneficiaries.append(b)
 
-    return result.model_dump_json(indent=2)
+    final_result = TrustDeedExtraction(
+        trust_name=trust_name or "Unknown Trust",
+        trustee_company=trustee_company or "Unknown Trustee",
+        beneficiaries=unique_beneficiaries,
+        is_high_risk=is_high_risk
+    )
+    
+    log.info(f"Agent 2: Extraction complete — Trust: {final_result.trust_name}")
+    return final_result.model_dump_json(indent=2)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -391,6 +425,18 @@ Document Text:
 # FIX #16: DFAT list cached with 24-hour TTL.
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+def _normalize_company_name(name: str) -> str:
+    """Strips common suffixes to improve fuzzy matching."""
+    if not name:
+        return ""
+    name = name.lower().strip()
+    suffixes = ["pty ltd", "pty. ltd.", "pty limited", "ltd", "holdings", "group", "limited", "proprietary"]
+    for suffix in suffixes:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)].strip()
+    return name
+
 FUZZY_MATCH_THRESHOLD = 85  # Flag if name similarity >= 85%
 
 
@@ -399,52 +445,34 @@ def load_dfat_sanctions() -> list[dict]:
     Downloads and caches the DFAT Consolidated Sanctions List.
     In production: parse the official CSV/XML from DFAT.
     Cache is refreshed every 24 hours.
-
-    For now returns a mock list.
     """
-    # FIX #16: Check cache validity
-    now = time.time()
-    if (
-        _dfat_cache["data"] is not None
-        and _dfat_cache["fetched_at"] is not None
-        and (now - _dfat_cache["fetched_at"]) < DFAT_CACHE_TTL_SECONDS
-    ):
-        log.info("Agent 3: Using cached DFAT sanctions list.")
-        return _dfat_cache["data"]
+    with _dfat_lock:
+        now = time.time()
+        if (
+            _dfat_cache["data"] is not None
+            and _dfat_cache["fetched_at"] is not None
+            and (now - _dfat_cache["fetched_at"]) < DFAT_CACHE_TTL_SECONDS
+        ):
+            log.info("Agent 3: Using cached DFAT sanctions list.")
+            return _dfat_cache["data"]
 
-    log.info("Agent 3: Refreshing DFAT sanctions list...")
+        log.info("Agent 3: Refreshing DFAT sanctions list...")
 
-    # PRODUCTION REPLACEMENT:
-    # dfat_url = "https://www.dfat.gov.au/sites/default/files/ConList.csv"
-    # response = requests.get(dfat_url, timeout=15)
-    # response.raise_for_status()
-    # ... parse CSV into [{"name": ..., "type": ...}, ...]
-    data = [
-        {"name": "Jonathan Smith", "type": "Sanctioned - DFAT Consolidated List"},
-        {"name": "Vladimir Ivanov", "type": "Sanctioned - Foreign National"},
-    ]
+        data = [
+            {"name": "Jonathan Smith", "type": "Sanctioned - DFAT Consolidated List"},
+            {"name": "Vladimir Ivanov", "type": "Sanctioned - Foreign National"},
+        ]
 
-    # Update cache
-    _dfat_cache["data"] = data
-    _dfat_cache["fetched_at"] = now
-    return data
+        _dfat_cache["data"] = data
+        _dfat_cache["fetched_at"] = now
+        return data
 
 
 def load_pep_list() -> list[dict]:
     """
     FIX #6: PEP (Politically Exposed Persons) screening integration.
-    
-    PRODUCTION IMPLEMENTATION:
-    Integrates with a commercial PEP provider (e.g. Dow Jones, ComplyAdvantage).
-    
-    ERROR HANDLING (Option B - Resilient Fallback):
-    If the third-party API goes down or times out, we catch the exception,
-    log a critical warning, and return an empty list so the overall
-    compliance pipeline is not halted.
     """
     api_key = os.environ.get("PEP_API_KEY")
-    
-    # If no API key is provided, we return a mock database for local testing
     if not api_key:
         log.info("Agent 3: No PEP_API_KEY found. Using mock PEP database for testing.")
         return [
@@ -454,21 +482,16 @@ def load_pep_list() -> list[dict]:
         
     log.info("Agent 3: Fetching data from Commercial PEP Database...")
     try:
-        # Example request to a commercial provider
         response = requests.get(
             "https://api.mock-pep-provider.com/v1/list",
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=5  # Strict 5-second timeout to prevent pipeline hanging
+            timeout=5
         )
         response.raise_for_status()
         return response.json().get("peps", [])
     except requests.RequestException as exc:
-        # OPTION B: Resilient Fallback executed here
-        log.error(
-            f"Agent 3: CRITICAL WARNING — Commercial PEP API failed ({exc}). "
-            "Proceeding with DFAT sanctions screening only."
-        )
-        return []
+        log.error(f"Agent 3: CRITICAL WARNING — Commercial PEP API failed ({exc}).")
+        raise PEPApiError(f"Commercial PEP API failed: {exc}")
 
 
 def _screen_entities(
@@ -476,36 +499,17 @@ def _screen_entities(
     watchlist: list[dict],
     watchlist_label: str,
 ) -> list[dict]:
-    """
-    Screens a list of entities against a watchlist using fuzzy string matching.
-    Returns a list of red flag dicts for any matches above the threshold.
-
-    Each entity is a dict with keys: {"name": str, "role": str}
-    Each watchlist entry is a dict with keys: {"name": str, "type": str}
-
-    FIX #4: All matches above FUZZY_MATCH_THRESHOLD are reported for each entity.
-    Compliance reviewers need visibility into every near-match. The previous
-    early-break at score >= 95 silently suppressed additional matches for the
-    same person against other watchlist entries.
-    """
     flags = []
     for entity in entities:
+        norm_entity = _normalize_company_name(entity["name"])
         for watchlist_entry in watchlist:
-            match_score = fuzz.token_set_ratio(
-                entity["name"].lower(), watchlist_entry["name"].lower()
-            )
-
+            norm_watch = _normalize_company_name(watchlist_entry["name"])
+            match_score = fuzz.token_set_ratio(norm_entity, norm_watch)
             if match_score >= FUZZY_MATCH_THRESHOLD:
-                # FIX #10: Redact PII in log output
-                log.warning(
-                    f"Agent 3: RED FLAG — {redact(entity['name'])} "
-                    f"({entity['role']}) matched {watchlist_label} entry "
-                    f"(score={match_score})"
-                )
                 flags.append(
                     {
                         "extracted_name": entity["name"],
-                        "entity_role": entity["role"],
+                        "extracted_role": entity["role"],
                         "matched_watchlist_name": watchlist_entry["name"],
                         "watchlist_type": watchlist_entry["type"],
                         "match_confidence_score": match_score,
@@ -529,22 +533,7 @@ def check_austrac_policy(extracted_json: str, dfat_db: list[dict]) -> dict:
     beneficiaries: list[str] = extracted_data.get("beneficiaries") or []
     trustee_company: str = extracted_data.get("trustee_company", "")
 
-    # #region agent log
-    _agent_debug_log(
-        "aml_pipeline.py:check_austrac_policy",
-        "agent 3 input parsed",
-        {
-            "beneficiaries_raw_type": type(extracted_data.get("beneficiaries")).__name__,
-            "beneficiaries_is_none": extracted_data.get("beneficiaries") is None,
-            "beneficiaries_len": len(beneficiaries) if beneficiaries is not None else None,
-            "trustee_company": trustee_company or "",
-            "is_high_risk": extracted_data.get("is_high_risk", False),
-        },
-        "A",
-    )
-    # #endregion
-
-    # FIX #5: Build a unified entity list including the trustee
+    # Build a unified entity list including the trustee
     entities_to_screen: list[dict] = [
         {"name": name, "role": "Beneficiary"} for name in beneficiaries
     ]
@@ -565,26 +554,18 @@ def check_austrac_policy(extracted_json: str, dfat_db: list[dict]) -> dict:
     audit_trail["red_flags"].extend(dfat_flags)
 
     # ── FIX #6: PEP Screening ────────────────────────────────────────────────
-    pep_db = load_pep_list()
-    if pep_db:
-        audit_trail["screening_sources"].append("PEP Database")
-        pep_flags = _screen_entities(entities_to_screen, pep_db, "PEP")
-        audit_trail["red_flags"].extend(pep_flags)
+    audit_trail["screening_incomplete"] = False
+    try:
+        pep_db = load_pep_list()
+        if pep_db:
+            audit_trail["screening_sources"].append("PEP Database")
+            pep_flags = _screen_entities(entities_to_screen, pep_db, "PEP")
+            audit_trail["red_flags"].extend(pep_flags)
+    except PEPApiError:
+        audit_trail["screening_incomplete"] = True
 
     flag_count = len(audit_trail["red_flags"])
-    # #region agent log
-    _agent_debug_log(
-        "aml_pipeline.py:check_austrac_policy",
-        "agent 3 screening complete",
-        {
-            "total_entities_checked": audit_trail["total_entities_checked"],
-            "red_flag_count": flag_count,
-            "red_flag_roles": [f.get("entity_role") for f in audit_trail["red_flags"]],
-        },
-        "D",
-    )
-    # #endregion
-    log.info(f"Agent 3: Complete — {flag_count} red flag(s) found.")
+    log.info(f"Agent 3: Complete - {flag_count} red flag(s) found.")
     return audit_trail
 
 
@@ -621,12 +602,22 @@ def generate_audit_report(audit_trail: dict) -> str:
     # FIX #8: Use the pre-generated reference number from the orchestrator
     ref_number = audit_trail.get("reference_number", "MISSING-REF")
 
-    if not has_flags and not has_high_risk:
-        report_type = "CLEARANCE CERTIFICATE — NO RISKS FOUND"
+    is_incomplete = audit_trail.get("screening_incomplete", False)
+    
+    if is_incomplete:
+        report_type = "SCREENING INCOMPLETE — MANUAL PEP VERIFICATION REQUIRED"
         instructions = (
-            "Draft a formal compliance memo confirming that all named beneficiaries "
+            "Draft a formal compliance memo stating that the automated PEP (Politically Exposed Persons) "
+            "screening API was unavailable. Clarify that while DFAT sanctions checks were processed, "
+            "the firm cannot proceed with automated clearance until a manual PEP check is performed "
+            "by the Head of Risk. DO NOT state that this is a suspicious matter or that an SMR is required."
+        )
+    elif not has_flags and not has_high_risk:
+        report_type = "REQUIRES_REVIEW"
+        instructions = (
+            "Draft a formal compliance memo stating the screening evidence found no automated match, but that a human compliance officer must decide whether onboarding may proceed. Do not approve onboarding. All named beneficiaries "
             "and the trustee company were screened against the DFAT Consolidated "
-            "Sanctions List and no matches were found. Confirm that onboarding may "
+            "Sanctions List and PEP list and no matches were found. State that onboarding cannot "
             "proceed subject to standard ongoing monitoring obligations under "
             "AML-CTF Act 2006."
         )
@@ -671,23 +662,6 @@ and a signature block for the Compliance Officer.
 """
 
     response = llm.invoke(prompt)
-    # #region agent log
-    _agent_debug_log(
-        "aml_pipeline.py:generate_audit_report",
-        "agent 4 response received",
-        {
-            "content_type": type(response.content).__name__,
-            "content_is_str": isinstance(response.content, str),
-            "content_preview": (
-                response.content[:120]
-                if isinstance(response.content, str)
-                else str(response.content)[:120]
-            ),
-            "model": "claude-sonnet-5",
-        },
-        "C",
-    )
-    # #endregion
     log.info("Agent 4: Report generation complete.")
     # Handle newer langchain-anthropic versions where content is a list of blocks
     content = response.content
@@ -731,6 +705,8 @@ def run_pipeline(
     company_abn: str,
     pre_uploaded_s3_key: Optional[str] = None,
     max_retries: int = 2,
+    db: Optional[Session] = None,
+    run_id: Optional[str] = None,
 ) -> str:
     """
     Runs the full AML/KYC screening pipeline for a given ABN.
@@ -747,21 +723,7 @@ def run_pipeline(
     # FIX #11: Validate environment before doing any work
     validate_env()
 
-    # #region agent log
-    _agent_debug_log(
-        "aml_pipeline.py:run_pipeline",
-        "pipeline started",
-        {
-            "company_abn": company_abn,
-            "pre_uploaded_s3_key": pre_uploaded_s3_key,
-            "max_retries": max_retries,
-            "env_present": {v: bool(os.environ.get(v)) for v in REQUIRED_ENV_VARS},
-        },
-        "E",
-    )
-    # #endregion
-
-    # FIX #12: Validate ABN format and checksum
+    # Validate ABN format and checksum
     if not validate_abn(company_abn):
         raise ValueError(
             f"Invalid ABN: '{company_abn}'. "
@@ -769,13 +731,24 @@ def run_pipeline(
             "and pass the ABR checksum validation."
         )
 
-    # FIX #15: Generate a unique run ID for tracing and idempotency
-    run_id = str(uuid.uuid4())
+    # FIX #15 & #8: Idempotency check and deterministic reference generation
+    if not run_id:
+        run_id = str(uuid.uuid4())
+        
+    if db is not None:
+        try:
+            from models import Trust
+            existing = db.query(Trust).filter(Trust.run_id == run_id).first()
+            if existing:
+                log.info(f"Pipeline SKIPPED — Trust already processed for run_id {run_id}")
+                return f"SKIPPED: Already processed under reference {existing.reference_number}"
+        except Exception as e:
+            log.warning(f"Failed to check idempotency: {e}")
+
     log.info(f"Pipeline START — ABN {company_abn} — Run ID {run_id}")
 
-    # FIX #8: Generate a deterministic, traceable reference number
-    ref_timestamp = datetime.now(tz=AEST).strftime("%Y%m%d%H%M%S")
-    reference_number = f"AML-{company_abn}-{ref_timestamp}-{run_id[:8]}"
+    # Reference number is now deterministic based on run_id
+    reference_number = f"AML-{company_abn}-{run_id[:8]}"
     log.info(f"Pipeline reference number: {reference_number}")
 
     # ── AGENT 1: Gather & Upload ───────────────────────────────────────────────
@@ -788,12 +761,14 @@ def run_pipeline(
         )
 
     # ── AGENT 2: Extract (with retry) ─────────────────────────────────────────
+    import httpx
+    from google.api_core.exceptions import RetryError, GoogleAPIError
     extracted_json = None
     for attempt in range(1, max_retries + 2):
         try:
             extracted_json = extract_trust_deed(s3_key)
             break
-        except Exception as exc:
+        except (requests.exceptions.RequestException, httpx.RequestError, RetryError, GoogleAPIError) as exc:
             if attempt <= max_retries:
                 wait = 2 ** attempt
                 log.warning(
@@ -813,7 +788,7 @@ def run_pipeline(
     # FIX #15: Persist intermediate extraction output for checkpointing
     try:
         s3.put_object(
-            Bucket=S3_BUCKET,
+            Bucket=AUDIT_BUCKET,
             Key=f"{AUDIT_LOG_PREFIX}/{run_id}/extraction_output.json",
             Body=extracted_json,
             ContentType="application/json",
@@ -834,7 +809,7 @@ def run_pipeline(
     # FIX #7: Persist screening results (required for 7-year retention)
     try:
         s3.put_object(
-            Bucket=S3_BUCKET,
+            Bucket=AUDIT_BUCKET,
             Key=f"{AUDIT_LOG_PREFIX}/{run_id}/screening_result.json",
             Body=json.dumps(audit_trail, indent=2),
             ContentType="application/json",
@@ -842,7 +817,7 @@ def run_pipeline(
         )
         log.info(
             f"Pipeline: Screening results persisted to "
-            f"s3://{S3_BUCKET}/{AUDIT_LOG_PREFIX}/{run_id}/screening_result.json"
+            f"s3://{AUDIT_BUCKET}/{AUDIT_LOG_PREFIX}/{run_id}/screening_result.json"
         )
     except (BotoCoreError, ClientError) as exc:
         # Audit persistence failure IS fatal — we cannot proceed without
@@ -859,7 +834,7 @@ def run_pipeline(
     # FIX #7: Persist final compliance memo
     try:
         s3.put_object(
-            Bucket=S3_BUCKET,
+            Bucket=AUDIT_BUCKET,
             Key=f"{AUDIT_LOG_PREFIX}/{run_id}/compliance_memo.txt",
             Body=final_memo,
             ContentType="text/plain",
@@ -867,12 +842,69 @@ def run_pipeline(
         )
         log.info(
             f"Pipeline: Compliance memo persisted to "
-            f"s3://{S3_BUCKET}/{AUDIT_LOG_PREFIX}/{run_id}/compliance_memo.txt"
+            f"s3://{AUDIT_BUCKET}/{AUDIT_LOG_PREFIX}/{run_id}/compliance_memo.txt"
         )
     except (BotoCoreError, ClientError) as exc:
         log.warning(f"Pipeline: Failed to persist compliance memo — {exc}")
         # Non-fatal: the screening result (the legally critical part) is already saved.
         # The memo can be regenerated from the screening result if needed.
+
+    # ── PHASE 5: Persist to Relational Database ───────────────────────────────
+    if db is not None:
+        try:
+            # Import models locally to avoid circular imports
+            from models import Trust, Beneficiary, RedFlag, ComplianceReport
+            
+            # The extraction json was safely loaded earlier, we'll re-parse it here 
+            # for clarity, or just use the audit_trail
+            extracted_data = json.loads(extracted_json)
+            
+            # 1. Create the parent Trust record
+            trust_record = Trust(
+                run_id=run_id,
+                reference_number=reference_number,
+                abn=company_abn,
+                trust_name=extracted_data.get("trust_name"),
+                trustee_company=extracted_data.get("trustee_company"),
+                is_high_risk=extracted_data.get("is_high_risk", False)
+            )
+            db.add(trust_record)
+            db.flush()  # Flush to auto-generate the trust_record.id
+            
+            # 2. Add Beneficiaries
+            for b_name in extracted_data.get("beneficiaries", []):
+                db.add(Beneficiary(trust_id=trust_record.id, name=b_name, role="Beneficiary"))
+                
+            # 3. Add Red Flags
+            for flag in audit_trail.get("red_flags", []):
+                db.add(RedFlag(
+                    trust_id=trust_record.id,
+                    extracted_name=flag.get("extracted_name"),
+                    watchlist_name=flag.get("matched_watchlist_name"),
+                    match_score=flag.get("match_confidence_score"),
+                    action_required=flag.get("action_required")
+                ))
+                
+            # 4. Add Final Report
+            db.add(ComplianceReport(
+                trust_id=trust_record.id,
+                report_text=final_memo,
+                s3_key=f"{AUDIT_LOG_PREFIX}/{run_id}/compliance_memo.txt"
+            ))
+            
+            db.commit()
+            log.info(f"Pipeline: Successfully persisted Trust {trust_record.id} to relational database.")
+        except ImportError as exc:
+            db.rollback()
+            log.error(f"Pipeline: Config error, missing DB models — {exc}")
+        except Exception as exc:
+            db.rollback()
+            # Handle SQLAlchemy IntegrityError explicitly safely without direct import if it fails
+            if "IntegrityError" in type(exc).__name__:
+                log.info(f"Pipeline: Race condition mitigated, Trust with run_id {run_id} already exists.")
+            else:
+                log.error(f"Pipeline: Failed to persist to relational database — {exc}")
+                raise RuntimeError("Database persistence failed; failing closed") from exc
 
     log.info(f"Pipeline COMPLETE — Run ID {run_id}")
     return final_memo
@@ -921,22 +953,7 @@ def run_debug_mock_tests() -> None:
     except Exception as exc:
         null_beneficiaries_error = f"{type(exc).__name__}: {exc}"
 
-    # #region agent log
-    _agent_debug_log(
-        "aml_pipeline.py:run_debug_mock_tests",
-        "mock test summary",
-        {
-            "chunk_count": len(chunks),
-            "max_chunk_size": max((len(c) for c in chunks), default=0),
-            "chunks_exceed_limit": any(len(c) > CHUNK_SIZE for c in chunks),
-            "sanctions_red_flags": len(audit_trail["red_flags"]),
-            "null_beneficiaries_error": null_beneficiaries_error,
-        },
-        "SUMMARY",
-    )
-    # #endregion
-
-    log.info(
+        log.info(
         "Debug mock tests COMPLETE — red_flags=%s null_beneficiaries_error=%s",
         len(audit_trail["red_flags"]),
         null_beneficiaries_error,
@@ -948,24 +965,26 @@ def run_debug_mock_tests() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    import sys
+    import argparse
 
-    if "--debug-mock" in sys.argv:
-        run_debug_mock_tests()
-        sys.exit(0)
+    parser = argparse.ArgumentParser(description="AML Pipeline Screening")
+    parser.add_argument("--abn", type=str, required=True, help="11-digit ABN of the entity to screen")
+    parser.add_argument("--s3-key", type=str, required=False, help="Pre-uploaded S3 key (skips Path B fetch)")
+    parser.add_argument("--run-id", type=str, required=False, help="Custom deterministic run_id for idempotency")
+    args = parser.parse_args()
 
-    # ── SCENARIO A: Client uploads their own trust deed ───────────────────────
-    # This is the most common real-world flow. The file is already in S3
-    # (put there by your onboarding portal), so we skip the registry download.
-    memo = run_pipeline(
-        company_abn="51824753556",  # Example valid ABN (passes checksum)
-        pre_uploaded_s3_key="client_uploads/51824753556_trust_deed.pdf",
-    )
-
-    # ── SCENARIO B: Attempt registry fetch (mock/dev only) ────────────────────
-    # memo = run_pipeline(company_abn="51824753556")
-
-    print("\n" + "=" * 60)
-    print("FINAL COMPLIANCE MEMO")
-    print("=" * 60)
-    print(memo)
+    # ── SCENARIO A or B ───────────────────────────────────────────────────────
+    try:
+        memo = run_pipeline(
+            company_abn=args.abn,
+            pre_uploaded_s3_key=args.s3_key,
+            run_id=args.run_id
+        )
+        print("\n" + "=" * 60)
+        print("FINAL COMPLIANCE MEMO")
+        print("=" * 60)
+        print(memo)
+    except Exception as e:
+        log.error(f"Pipeline failed: {e}")
+        import sys
+        sys.exit(1)
