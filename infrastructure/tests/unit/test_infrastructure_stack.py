@@ -1,12 +1,16 @@
 import aws_cdk as cdk
 import aws_cdk.assertions as assertions
+from aws_cdk import aws_ecs as ecs
 
 from infrastructure.infrastructure_stack import InfrastructureStack
 
 
 def make_template() -> assertions.Template:
     app = cdk.App()
-    stack = InfrastructureStack(app, "TestStack")
+    # Inject a registry image instead of the local Dockerfile so unit tests
+    # do not trigger a Docker build during synthesis.
+    image = ecs.ContainerImage.from_registry("public.ecr.aws/dummy/sovereign:latest")
+    stack = InfrastructureStack(app, "TestStack", container_image=image)
     return assertions.Template.from_stack(stack)
 
 
