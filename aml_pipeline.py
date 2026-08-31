@@ -465,6 +465,91 @@ def _normalize_company_name(name: str) -> str:
             name = name[:-len(suffix)].strip()
     return name
 
+
+# --- Given-name nicknames / diminutives -------------------------------------
+# Agent 3 is deterministic by design (see docs/ADR-001). A sanctioned full name
+# (e.g. "Robert Smith") can be recorded on a trust deed under a common nickname
+# (e.g. "Bob Smith"). Raw fuzzy token matching scores these well below the 85%
+# threshold (Robert/Bob ~76), so without an explicit alias table a real match
+# would be silently missed. This curated, auditable map lets the screener expand
+# a first-name token to its canonical forms and re-score.
+# Format: diminutive -> canonical given name(s).
+_GIVEN_NAME_ALIASES = {
+    "bob": ["robert"],
+    "rob": ["robert"],
+    "bobby": ["robert"],
+    "bill": ["william"],
+    "will": ["william"],
+    "willy": ["william"],
+    "liz": ["elizabeth"],
+    "lizzy": ["elizabeth"],
+    "bess": ["elizabeth"],
+    "beth": ["elizabeth"],
+    "alex": ["alexander"],
+    "tony": ["anthony"],
+    "tonie": ["anthony"],
+    "jon": ["jonathan"],
+    "johnny": ["john"],
+    "mike": ["michael"],
+    "mikey": ["michael"],
+    "dick": ["richard"],
+    "rick": ["richard"],
+    "dickie": ["richard"],
+    "tom": ["thomas"],
+    "tommy": ["thomas"],
+    "sam": ["samuel"],
+    "nicky": ["nicholas"],
+    "nick": ["nicholas"],
+    "charlie": ["charles"],
+    "chuck": ["charles"],
+    "jim": ["james"],
+    "jimmy": ["james"],
+    "joe": ["joseph"],
+    "joey": ["joseph"],
+    "dan": ["daniel"],
+    "danny": ["daniel"],
+    "pat": ["patrick"],
+    "paddy": ["patrick"],
+    "maggie": ["margaret"],
+    "margie": ["margaret"],
+    "kate": ["catherine"],
+    "kathy": ["katherine"],
+    "katie": ["katherine"],
+    "jenny": ["jennifer"],
+    "jen": ["jennifer"],
+    "andy": ["andrew"],
+    "chris": ["christopher"],
+    "gina": ["georgina"],
+}
+
+
+def _expand_given_names(normalized: str) -> set[str]:
+    """
+    Return the set of canonical full-name forms after expanding any token whose
+    final segment matches a known given-name nickname.
+
+    Example: ``_expand_given_names("bob smith")`` -> {"bob smith", "robert smith"}
+    A 1-token name is treated as a pure given name, so it expands to the full
+    canonical given name too: ``_expand_given_names("bob")`` -> {"bob", "robert"}.
+    """
+    tokens = normalized.split()
+    if not tokens:
+        return set()
+    if len(tokens) == 1:
+        single = tokens[0].strip().rstrip(".")
+        forms = {single}
+        forms.update(_GIVEN_NAME_ALIASES.get(single, []))
+        return forms
+    expanded = {normalized}
+    for i, token in enumerate(tokens):
+        dim = token.strip().rstrip(".")
+        for canonical in _GIVEN_NAME_ALIASES.get(dim, []):
+            alt = list(tokens)
+            alt[i] = canonical
+            expanded.add(" ".join(alt))
+    return expanded
+
+
 FUZZY_MATCH_THRESHOLD = 85  # Flag if name similarity >= 85%
 
 
@@ -530,20 +615,47 @@ def _screen_entities(
     flags = []
     for entity in entities:
         norm_entity = _normalize_company_name(entity["name"])
+        # Candidate canonical forms of the entity name (nickname-expanded)
+        entity_forms = _expand_given_names(norm_entity)
         for watchlist_entry in watchlist:
             norm_watch = _normalize_company_name(watchlist_entry["name"])
-            match_score = fuzz.token_set_ratio(norm_entity, norm_watch)
-            if match_score >= FUZZY_MATCH_THRESHOLD:
-                flags.append(
-                    {
-                        "extracted_name": entity["name"],
-                        "extracted_role": entity["role"],
-                        "matched_watchlist_name": watchlist_entry["name"],
-                        "watchlist_type": watchlist_entry["type"],
-                        "match_confidence_score": match_score,
-                        "action_required": "Manual Review Required by Head of Risk",
-                    }
-                )
+            # Direct fuzzy score (unchanged behaviour)
+            direct_score = fuzz.token_set_ratio(norm_entity, norm_watch)
+            best_score = direct_score
+            alias_used = None
+
+            # If the direct match misses the threshold, try expanding either
+            # side's given names against the other to catch nickname/diminutive
+            # variants (e.g. "Bob Smith" vs sanctioned "Robert Smith").
+            if direct_score < FUZZY_MATCH_THRESHOLD:
+                watch_forms = _expand_given_names(norm_watch)
+                # Expand the entity's given names; compare each form to the
+                # watchlist name.
+                for cand in entity_forms:
+                    score = fuzz.token_set_ratio(cand, norm_watch)
+                    if score > best_score:
+                        best_score = score
+                        alias_used = f"{watchlist_label} alias expansion"
+                # Expand the watchlist's given names; compare each form to the
+                # entity name.
+                for cand in watch_forms:
+                    score = fuzz.token_set_ratio(cand, norm_entity)
+                    if score > best_score:
+                        best_score = score
+                        alias_used = f"{watchlist_label} alias expansion"
+
+            if best_score >= FUZZY_MATCH_THRESHOLD:
+                flag = {
+                    "extracted_name": entity["name"],
+                    "extracted_role": entity["role"],
+                    "matched_watchlist_name": watchlist_entry["name"],
+                    "watchlist_type": watchlist_entry["type"],
+                    "match_confidence_score": best_score,
+                    "action_required": "Manual Review Required by Head of Risk",
+                }
+                if alias_used:
+                    flag["match_reason"] = alias_used
+                flags.append(flag)
     return flags
 
 

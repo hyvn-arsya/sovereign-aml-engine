@@ -113,3 +113,47 @@ def test_chunk_splitting():
     assert len(chunks[-1]) == 5000
     # Reassembled, they should contain the same characters (though overlapping)
     assert all(c.startswith("A") for c in chunks)
+
+
+def test_nickname_matching_catches_previously_missed_sanctioned_entities():
+    """A sanctioned full name recorded under a common nickname must still flag.
+
+    Raw fuzzy token matching scores these below the 85% threshold
+    (e.g. Robert/Bob ~= 76, William/Bill ~= 78), so the deterministic alias
+    table in Agent 3 must expand the diminutive and re-score.
+    """
+    watchlist = [
+        {"name": "Robert Smith", "type": "Sanctioned"},
+        {"name": "William Jones", "type": "Sanctioned"},
+        {"name": "Richard Nixon", "type": "Sanctioned"},
+        {"name": "Alexander Hamilton", "type": "Sanctioned"},
+    ]
+    beneficiaries = [
+        {"name": "Bob Smith", "role": "Beneficiary"},
+        {"name": "Bill Jones", "role": "Beneficiary"},
+        {"name": "Dick Nixon", "role": "Beneficiary"},
+        {"name": "Alex Hamilton", "role": "Beneficiary"},
+    ]
+    flags = _screen_entities(beneficiaries, watchlist, "DFAT")
+    assert len(flags) == 4
+    matched = {f["extracted_name"] for f in flags}
+    assert matched == {"Bob Smith", "Bill Jones", "Dick Nixon", "Alex Hamilton"}
+    # Every nickname-driven match is explicitly labelled as alias expansion
+    assert all(f.get("match_reason") == "DFAT alias expansion" for f in flags)
+
+
+def test_nickname_matching_avoids_false_positives():
+    """Alias expansion must not create matches for genuinely different people."""
+    watchlist = [{"name": "Robert Smith", "type": "Sanctioned"}]
+
+    # Different surname, coincidental first-name nickname -> no match
+    res = _screen_entities(
+        [{"name": "Bob Marley", "role": "Beneficiary"}], watchlist, "DFAT"
+    )
+    assert len(res) == 0
+
+    # Same surname but completely different first name -> no match
+    res = _screen_entities(
+        [{"name": "Alice Smith", "role": "Beneficiary"}], watchlist, "DFAT"
+    )
+    assert len(res) == 0
