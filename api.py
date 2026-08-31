@@ -1,11 +1,17 @@
 import logging
 import os
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from dotenv import load_dotenv
+
+# Load environment variables from .env file before anything else, overriding any cached empty vars
+load_dotenv(override=True)
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel, Field
 from typing import Optional
+from sqlalchemy.orm import Session
 
-# Import the core logic from our pipeline
+# Import the core logic and database dependencies
 from aml_pipeline import run_pipeline
+from database import get_db
 
 # Configure basic logging for the API layer
 logging.basicConfig(level=logging.INFO)
@@ -52,7 +58,7 @@ def health_check():
     return {"status": "ok", "environment": os.environ.get("ENV", "development")}
 
 @app.post("/analyze/abn", response_model=AnalyzeResponse, tags=["Screening"])
-def analyze_entity(request: AnalyzeRequest):
+def analyze_entity(request: AnalyzeRequest, db: Session = Depends(get_db)):
     """
     Synchronous MVP (Option A): Triggers the 4-Agent pipeline and blocks
     until the final compliance memo is generated.
@@ -65,7 +71,8 @@ def analyze_entity(request: AnalyzeRequest):
         report_markdown = run_pipeline(
             company_abn=request.company_abn,
             pre_uploaded_s3_key=request.pre_uploaded_s3_key,
-            max_retries=2
+            max_retries=2,
+            db=db
         )
         
         return AnalyzeResponse(
