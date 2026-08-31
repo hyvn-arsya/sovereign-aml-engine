@@ -22,6 +22,8 @@ Full reasoning — including AUSTRAC Part 11 record-keeping, cost, and the rejec
 
 **A concrete example of why this matters:** fuzzy matching alone misses common nickname/diminutive variants — a sanctioned *"Robert Smith"* recorded on a deed as *"Bob Smith"* scores only ~76% (below the 85% flag threshold) and would silently slip through. Because Agent 3 is deterministic and auditable, the fix is a curated alias table that expands *Bob→Robert, Bill→William, Dick→Richard* and re-scores, with every such match explicitly labelled `"alias expansion"` in the audit trail. This is the difference between "an AI that screens" and "an AI pipeline a compliance team can defend."
 
+> **Honesty note:** this alias table is a deliberately small (~45-entry) English-language **seed list**, not a claim of coverage. It will not catch transliteration variants of non-English names — arguably a bigger real-world AML risk given the composition of DFAT's actual sanctions list — and in production it would be backed by a proper reference-data vendor. Like the mocked DFAT/PEP data in the pipeline, it's there to prove the mechanism, not to assert completeness.
+
 ---
 
 ## Architecture

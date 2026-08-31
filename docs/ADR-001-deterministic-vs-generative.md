@@ -32,6 +32,8 @@ The question: which agents should use large language models (generative), and wh
 - **Regulatory defensibility**: AUSTRAC AML/CTF Rule 57.1 requires that reporting entities "take reasonable steps" to screen customers. A deterministic, testable algorithm with documented thresholds is a stronger demonstration of "reasonable steps" than a prompt-response from a model that may vary between calls.
 - **Reliability**: Agent 3 never hallucinates a sanctions match. It either finds one above the threshold or it doesn't. This eliminates the class of LLM errors — false positives from pattern-matching, false negatives from misunderstanding entity name formats — that would be catastrophic in a compliance context.
 
+> **Note on scope:** the nickname/diminutive alias table used to widen matching is a deliberately small (~45-entry) English-language **seed list**, not a claim of coverage. It won't catch transliteration variants of non-English names — a bigger real-world risk given DFAT's actual sanctions composition — and production would back it with a reference-data vendor.
+
 ### What we accept
 
 - **Agent 2 and 4 hallucination risk**: LLMs can produce incorrect extractions (Agent 2) or fabricate details in reports (Agent 4). We mitigate this by:
