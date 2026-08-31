@@ -16,7 +16,7 @@ So **Agent 3 (sanctions & PEP screening) is pure deterministic RapidFuzz code** 
 |-------|--------|-----|
 | **2 — Extraction** | LlamaParse + Gemini | Understanding hundreds of pages of legal text — genuinely needs LLM comprehension |
 | **3 — Screening** | **Deterministic RapidFuzz** | A regulated decision: auditable, explainable, zero hallucination, near-zero cost at scale |
-| **4 — Reporting** | Claude 3.5 Sonnet | Human-facing narrative from a fixed, deterministic audit trail |
+| **4 — Reporting** | Claude Sonnet | Human-facing narrative from a fixed, deterministic audit trail |
 
 Full reasoning — including AUSTRAC Part 11 record-keeping, cost, and the rejected "LLM for everything" alternative — is in **[`docs/ADR-001-deterministic-vs-generative.md`](docs/ADR-001-deterministic-vs-generative.md)**.
 
@@ -33,11 +33,11 @@ A 4-agent orchestration pipeline with deterministic screening at its core and LL
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Agent 1   DATA GATHERING          S3 upload, ABN format+checksum    │
-│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + Gemini-1.5-Pro       │
+│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + Gemini 3.1 Pro        │
 │            (chunk & merge)         context-window guard, retries     │
 │  Agent 3   DETERMINISTIC SCREENING RapidFuzz vs DFAT sanctions + PEP │
 │            (no LLM)                name normalization, redaction      │
-│  Agent 4   REPORT DRAFTING         Claude 3.5 Sonnet audit memo      │
+│  Agent 4   REPORT DRAFTING         Claude Sonnet audit memo           │
 └─────────────────────────────────────────────────────────────────────┘
               │                                   │
               ▼                                   ▼
@@ -48,7 +48,7 @@ A 4-agent orchestration pipeline with deterministic screening at its core and LL
 - **Agent 1** — Validates the ABN (format + checksum) and retrieves ASIC company data; accepts a pre-uploaded S3 PDF.
 - **Agent 2** — Parses trust deeds with LlamaParse and extracts the ownership structure with Gemini. Oversized documents are chunked and truncated to fit the context window; each step has retry and error handling.
 - **Agent 3** — The only mandated deterministic step. Normalizes entity names (`Acme Pty Ltd` → `acme`), fuzzy-matches all beneficiaries and the trustee company against the **DFAT sanctions list** (RapidFuzz, 85%+ threshold) and a PEP watchlist. PII is redacted in logs.
-- **Agent 4** — Drafts a comprehensive AUSTRAC compliance memo with Claude 3.5 Sonnet, citing the full audit trail.
+- **Agent 4** — Drafts a comprehensive AUSTRAC compliance memo with Claude Sonnet, citing the full audit trail.
 
 The orchestrator (`run_pipeline`) coordinates the agents, assigns a deterministic reference number, persists an audit trail to S3 (7-year retention), and writes screening results to the database.
 
