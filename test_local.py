@@ -116,7 +116,6 @@ def test_full_pipeline_local(pdf_path: str):
         load_dfat_sanctions,
         generate_audit_report,
     )
-    from langchain_openai import ChatOpenAI
     from datetime import datetime
     from zoneinfo import ZoneInfo
     import uuid

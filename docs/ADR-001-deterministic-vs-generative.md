@@ -21,7 +21,7 @@ The question: which agents should use large language models (generative), and wh
 | **1 — Data Gathering** | Boto3 / ABN validation | Pure I/O and checksum validation. No LLM needed. |
 | **2 — Document Extraction** | LlamaParse + Gemini 3.1 Pro | Trust deeds are hundreds of pages of unstructured legal text. Extracting entities, trustee companies, and variation chronology requires genuine reading comprehension that no rule-based system can replicate. LLMs are the right tool here because the task is *understanding*, not *deciding*. |
 | **3 — Sanctions & PEP Screening** | RapidFuzz + DFAT sanctions list | This is a **regulated decision** — screening an entity against a government sanctions list is deterministic by design. The answer is either "match found above 85% threshold" or "no match." Using an LLM here would introduce non-determinism into a step that AUSTRAC requires you to explain in audit reviews. If an examiner asks "why was this entity flagged/not flagged," the answer must be a traceable, auditable algorithm — not a prompt response. |
-| **4 — Report Drafting** | Claude 3.5 Sonnet | The compliance memo is a human-facing narrative document for an internal review team. It synthesises the structured audit trail (generated deterministically by Agent 3) into a readable report. This is a drafting/summarisation task where LLMs excel and where non-determinism in prose quality is acceptable — the underlying screening facts are fixed. |
+| **4 — Report Drafting** | Claude Sonnet | The compliance memo is a human-facing narrative document for an internal review team. It synthesises the structured audit trail (generated deterministically by Agent 3) into a readable report. This is a drafting/summarisation task where LLMs excel and where non-determinism in prose quality is acceptable — the underlying screening facts are fixed. |
 
 ## Consequences
 
@@ -31,6 +31,8 @@ The question: which agents should use large language models (generative), and wh
 - **Cost control**: Screening hundreds of entities against thousands of sanctions records is a high-volume, low-latency task. RapidFuzz processes thousands of fuzzy matches in milliseconds at zero marginal cost. The same operation via LLM API calls would cost dollars per screening and add minutes of latency.
 - **Regulatory defensibility**: AUSTRAC AML/CTF Rule 57.1 requires that reporting entities "take reasonable steps" to screen customers. A deterministic, testable algorithm with documented thresholds is a stronger demonstration of "reasonable steps" than a prompt-response from a model that may vary between calls.
 - **Reliability**: Agent 3 never hallucinates a sanctions match. It either finds one above the threshold or it doesn't. This eliminates the class of LLM errors — false positives from pattern-matching, false negatives from misunderstanding entity name formats — that would be catastrophic in a compliance context.
+
+> **Note on scope:** the nickname/diminutive alias table used to widen matching is a deliberately small (~45-entry) English-language **seed list**, not a claim of coverage. It won't catch transliteration variants of non-English names — a bigger real-world risk given DFAT's actual sanctions composition — and production would back it with a reference-data vendor.
 
 ### What we accept
 
