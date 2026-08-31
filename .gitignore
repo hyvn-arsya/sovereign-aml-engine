@@ -53,3 +53,6 @@ node_modules/
 !infrastructure/requirements-dev.txt
 !infrastructure/source.bat
 !infrastructure/.gitignore
+
+# Portfolio documentation
+!README.md
