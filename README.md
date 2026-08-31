@@ -6,6 +6,24 @@ The system ingests an Australian trust deed / entity PDF, extracts the underlyin
 
 ---
 
+## ✳ The Core Design Decision: Deterministic vs Generative
+
+The single most important architectural choice in this project is **which agents use LLMs and which don't**. Compliance screening is not a place for improvisation: if an AUSTRAC examiner asks *"why was this entity flagged / not flagged?"*, the answer must be a traceable, deterministic, explainable algorithm — not a prompt response that can differ between calls.
+
+So **Agent 3 (sanctions & PEP screening) is pure deterministic RapidFuzz code** — zero LLM — while **Agents 2 (document extraction) and 4 (report drafting) use LLMs** where human-grade comprehension and drafting genuinely require them.
+
+| Agent | Method | Why |
+|-------|--------|-----|
+| **2 — Extraction** | LlamaParse + Gemini | Understanding hundreds of pages of legal text — genuinely needs LLM comprehension |
+| **3 — Screening** | **Deterministic RapidFuzz** | A regulated decision: auditable, explainable, zero hallucination, near-zero cost at scale |
+| **4 — Reporting** | Claude 3.5 Sonnet | Human-facing narrative from a fixed, deterministic audit trail |
+
+Full reasoning — including AUSTRAC Part 11 record-keeping, cost, and the rejected "LLM for everything" alternative — is in **[`docs/ADR-001-deterministic-vs-generative.md`](docs/ADR-001-deterministic-vs-generative.md)**.
+
+**A concrete example of why this matters:** fuzzy matching alone misses common nickname/diminutive variants — a sanctioned *"Robert Smith"* recorded on a deed as *"Bob Smith"* scores only ~76% (below the 85% flag threshold) and would silently slip through. Because Agent 3 is deterministic and auditable, the fix is a curated alias table that expands *Bob→Robert, Bill→William, Dick→Richard* and re-scores, with every such match explicitly labelled `"alias expansion"` in the audit trail. This is the difference between "an AI that screens" and "an AI pipeline a compliance team can defend."
+
+---
+
 ## Architecture
 
 A 4-agent orchestration pipeline with deterministic screening at its core and LLMs used only where human-grade document comprehension and drafting are required.
@@ -38,16 +56,19 @@ The orchestrator (`run_pipeline`) coordinates the agents, assigns a deterministi
 
 ```
 sovereign-aml-engine
-├── api.py                    # FastAPI app (REST endpoints)
+├── api.py                    # FastAPI app (sync + async job endpoints)
 ├── aml_pipeline.py           # 4-agent pipeline orchestrator
-├── models.py                 # SQLAlchemy ORM models
+├── models.py                 # SQLAlchemy ORM models (incl. AnalysisJob)
 ├── database.py               # DB engine/session (SQLite local, Postgres/RDS)
 ├── init_db.py                # Create database tables
 ├── test_aml_pipeline.py      # Unit tests for screening logic
 ├── Dockerfile                # Containerized FastAPI (uvicorn, port 8000)
-├── docker-compose.yml        # Local PostgreSQL for development
+├── docker-compose.yml        # App + PostgreSQL, one-command demo
 ├── sovereign-aml.yaml        # Raw CloudFormation IaC reference
+├── requirements.txt          # Runtime dependencies
+├── requirements-dev.txt      # Test / dev-only dependencies
 ├── .env.example              # Env var template (never commit real .env)
+├── docs/                     # Architecture Decision Records (start with ADR-001)
 └── infrastructure/           # ☁️ AWS CDK (Python) — production deployment
     ├── app.py                # CDK entry point, env-aware stack naming
     ├── cdk.json
@@ -90,18 +111,26 @@ uvicorn api:app --reload
 
 **Endpoints** (OpenAPI docs at `http://localhost:8000/docs`):
 
-| Method | Path            | Description                                                     |
-|--------|-----------------|-----------------------------------------------------------------|
-| GET    | `/health`       | Liveness probe used by the ALB health check                    |
-| POST   | `/analyze/abn`  | Run the full 4-agent pipeline for an ABN, return compliance memo |
+| Method | Path                  | Description                                                     |
+|--------|-----------------------|-----------------------------------------------------------------|
+| GET    | `/health`             | Liveness probe used by the ALB health check                    |
+| POST   | `/analyze/abn`        | Run the full 4-agent pipeline, block for the compliance memo   |
+| POST   | `/analyze/abn/async`  | Queue the pipeline (202 + `job_id`), return immediately        |
+| GET    | `/jobs/{job_id}`      | Poll an async job's status and result                          |
 
 ```bash
 curl -X POST http://localhost:8000/analyze/abn \
   -H "Content-Type: application/json" \
   -d '{"company_abn": "51824753556"}'
+
+# Async (returns immediately, then poll the job):
+JOB=$(curl -s -X POST http://localhost:8000/analyze/abn/async \
+  -H "Content-Type: application/json" -d '{"company_abn":"51824753556"}' \
+  | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
+curl -s http://localhost:8000/jobs/$JOB
 ```
 
-> The synchronous MVP keeps the connection open for the 20–40s pipeline runtime.
+> The synchronous endpoint keeps the connection open for the 20–40s pipeline runtime. For production, use the async endpoint — the background worker is factored to run behind an SQS/Fargate consumer.
 
 ### 5. Run the tests
 
@@ -147,7 +176,8 @@ A standalone template (VPC, RDS, ECS Fargate, S3) provided as a reference altern
 
 - **API**: FastAPI, Uvicorn, Pydantic
 - **Agents**: LangChain + LlamaParse, Google Gemini, Anthropic Claude
-- **Screening**: RapidFuzz (deterministic, no LLM)
+- **Screening**: RapidFuzz (deterministic, no LLM), curated given-name alias table
+- **Job queue**: In-process async jobs (`POST /analyze/abn/async`) + `GET /jobs/{id}` polling; worker ready to run on SQS/Fargate
 - **Storage**: SQLAlchemy (SQLite local / PostgreSQL), Amazon S3 (+ KMS encryption)
 - **Cloud**: AWS CDK (Python) — S3, VPC, RDS, ECS Fargate, ALB, CloudWatch
 - **Containerization**: Docker, docker-compose
