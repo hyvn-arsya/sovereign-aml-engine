@@ -92,13 +92,14 @@ except Exception:
     AEST = timezone.utc
 
 # Chunk-and-merge constants for Agent 2.
-# CHUNK_SIZE: max characters per chunk sent to GPT-4o (~15k tokens, well within
-#   the 128k context window, leaving room for system prompt + structured output).
+# CHUNK_SIZE: max characters per chunk. Trust deeds can be hundreds of pages;
+#   chunks keep each LLM call well inside the model context window, leaving room
+#   for the system prompt + structured output.
 # CHUNK_OVERLAP: characters of overlap between consecutive chunks to avoid
 #   splitting an entity across a chunk boundary.
 CHUNK_SIZE = 60_000
 CHUNK_OVERLAP = 5_000
-EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-1.5-pro")
+EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-3.1-pro-preview")
 
 # ─────────────────────────────────────────────
 # SHARED S3 CLIENT (created once, reused)
@@ -264,7 +265,7 @@ def gather_asic_data(
 # AGENT 2 — DOCUMENT EXTRACTION (with chunk-and-merge)
 # Responsibility: Download PDF from S3 → parse with LlamaParse → split into
 #                overlapping chunks → extract structured JSON from each chunk
-#                via GPT-4o → merge results with deduplication.
+#                via Gemini (EXTRACTION_MODEL) → merge results with deduplication.
 #
 # Why chunk-and-merge instead of truncation:
 #   Trust deeds are highly structured legal documents. Beneficiary schedules,
@@ -289,14 +290,41 @@ class TrustDeedExtraction(BaseModel):
     )
 
 
+def _split_into_chunks(
+    text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP
+) -> list[str]:
+    """
+    Split a long document into overlapping character chunks.
+
+    Each chunk is ``chunk_size`` characters long, and consecutive chunks
+    overlap by ``overlap`` characters so that entities spanning a boundary are
+    not split apart. The final chunk holds whatever remains.
+
+    Chunk ``n`` (0-indexed) covers ``text[start_n : start_n + chunk_size]``
+    where ``start_n = n * step`` and ``step = chunk_size - overlap``.
+    """
+    if not text:
+        return []
+    step = chunk_size - overlap
+    if step <= 0:
+        step = chunk_size
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        if end == len(text):
+            break
+        start += step
+    return chunks
 
 
 
 def extract_trust_deed(s3_key: str) -> str:
     """
     Downloads the PDF from S3, writes it to a temp file, parses it with
-    LlamaParse, then uses GPT-4o to extract structured data from each chunk.
-    Results are merged with deduplication.
+    LlamaParse, then uses Gemini (EXTRACTION_MODEL) to extract structured data
+    from each chunk. Results are merged with deduplication.
 
     Returns: JSON string (not a Pydantic object) — ready for Agent 3.
     """
