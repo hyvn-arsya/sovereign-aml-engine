@@ -31,7 +31,7 @@ A 4-agent orchestration pipeline with deterministic screening at its core and LL
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Agent 1   DATA GATHERING          S3 upload, ABN format+checksum    │
-│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + Gemini-1.5-Pro       │
+│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + Gemini-4.1-Pro       │
 │            (chunk & merge)         context-window guard, retries     │
 │  Agent 3   DETERMINISTIC SCREENING RapidFuzz vs DFAT sanctions + PEP │
 │            (no LLM)                name normalization, redaction      │
