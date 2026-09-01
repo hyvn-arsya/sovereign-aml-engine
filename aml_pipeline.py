@@ -361,7 +361,11 @@ def extract_trust_deed(s3_key: str) -> str:
     if not parsed_document:
         raise ValueError("Agent 2: LlamaParse returned an empty document.")
 
-    markdown_text = parsed_document[0].text
+    # LlamaParse returns one document per page (default split_by_page), so
+    # concatenating every document is required to keep the full deed — reading
+    # only [0] would silently drop every page after the first and starve the
+    # screening of any parties named later in the document.
+    markdown_text = "\n".join(doc.text or "" for doc in parsed_document)
     log.info(f"Agent 2: Parsed {len(markdown_text)} characters of Markdown")
 
     # ── CHUNK-AND-MERGE EXTRACTION ──────────────────────────────────────────
