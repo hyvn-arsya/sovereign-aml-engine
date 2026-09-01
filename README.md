@@ -66,6 +66,7 @@ sovereign-aml-engine
 ├── database.py               # DB engine/session (SQLite local, Postgres/RDS)
 ├── init_db.py                # Create database tables
 ├── test_aml_pipeline.py      # Unit tests for screening logic
+├── test_moto_s3.py           # Moto-backed S3 integration tests (no AWS required)
 ├── Dockerfile                # Containerized FastAPI (uvicorn, port 8000)
 ├── docker-compose.yml        # App + PostgreSQL, one-command demo
 ├── sovereign-aml.yaml        # Raw CloudFormation IaC reference
@@ -142,8 +143,16 @@ curl -s http://localhost:8000/jobs/$JOB
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest                         # root pipeline tests
+python -m pytest                         # root pipeline + moto S3 integration tests
 python -m pytest infrastructure/tests     # CDK infrastructure tests
+```
+
+The root suite includes `test_moto_s3.py`, which exercises the **real boto3 S3 code paths** in `aml_pipeline` — `gather_asic_data` (registry → upload) and the audit-trail persistence inside `run_pipeline` (`extraction_output.json`, `screening_result.json`, `compliance_memo.txt`, each encrypted with `aws:kms`) — against an **in-process S3 mock** (`moto`). No AWS credentials or bucket are needed: moto intercepts botocore's S3 requests at the transport layer, so the same `put_object` calls the pipeline makes in production run for real. The external registry HTTP and the LLM agents are mocked; the S3 layer itself is the thing under test.
+
+To verify the S3 layer locally, run the moto-backed tests alone:
+
+```bash
+python -m pytest test_moto_s3.py -v
 ```
 
 ---

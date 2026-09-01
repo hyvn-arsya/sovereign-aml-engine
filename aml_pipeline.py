@@ -330,6 +330,54 @@ def _split_into_chunks(
     return chunks
 
 
+# Low-information values an LLM emits when a chunk simply does not mention the
+# trustee. These MUST never be treated as the current trustee: a later chunk
+# returning one must not overwrite a concrete name extracted from an earlier
+# chunk (e.g. actual `Pemberton Advisory Pty Ltd` -> `Not specified`).
+_TRUSTEE_PLACEHOLDERS = {
+    "not specified",
+    "unspecified",
+    "unknown",
+    "unknown trustee",
+    "n/a",
+    "na",
+    "none",
+    "null",
+    "not mentioned",
+    "not stated",
+    "not found",
+    "not provided",
+}
+
+
+def _is_meaningful_trustee(value: str) -> bool:
+    """True only for a value that names a real trustee, never a placeholder."""
+    if not value:
+        return False
+    return value.strip().lower() not in _TRUSTEE_PLACEHOLDERS
+
+
+def _reconcile_trustee(current: Optional[str], incoming: Optional[str]):
+    """Decide how to merge an incoming chunk's trustee with the current value.
+
+    Returns ``(new_value, discrepancy, skipped)`` where:
+      * ``new_value``   — the trustee to carry forward after this chunk.
+      * ``discrepancy`` — True when a concrete value REPLACED a different,
+        previously-concrete value (a genuine cross-chunk inconsistency worth
+        surfacing as a warning).
+      * ``skipped``     — True when ``incoming`` was a placeholder/empty and did
+        NOT overwrite anything.
+
+    Placeholders never propagate: once a concrete trustee is known (e.g.
+    ``Pemberton Advisory Pty Ltd``), a later chunk returning ``Not specified``
+    keeps the concrete value rather than erasing it.
+    """
+    if not _is_meaningful_trustee(incoming):
+        return current, False, True
+    if incoming == current:
+        return current, False, False
+    return incoming, bool(current), False
+
 
 def extract_trust_deed(s3_key: str) -> str:
     """
@@ -406,12 +454,25 @@ Document Text Chunk:
             if chunk_result.trust_name and not trust_name:
                 trust_name = chunk_result.trust_name
             
-            # Reconciliation Rule: Last chunk wins for trustee and risk
-            if chunk_result.trustee_company and chunk_result.trustee_company != trustee_company:
-                if trustee_company is not None:
-                    log.warning(f"Agent 2: Discrepancy in trustee_company across chunks. Overwriting '{trustee_company}' with '{chunk_result.trustee_company}' from chunk {i+1}.")
-                trustee_company = chunk_result.trustee_company
-            
+            # Reconciliation Rule for trustee_company: keep the latest specific
+            # value. Chunks that don't name the trustee may return a placeholder
+            # ("Not specified", etc.) — those must never overwrite a concrete name.
+            prior_trustee = trustee_company
+            trustee_company, trustee_discrepancy, trustee_skipped = _reconcile_trustee(
+                prior_trustee, chunk_result.trustee_company
+            )
+            if trustee_skipped:
+                log.info(
+                    f"Agent 2: Chunk {i+1} returned non-specific trustee "
+                    f"'{chunk_result.trustee_company}'; keeping '{prior_trustee or 'unknown'}'."
+                )
+            elif trustee_discrepancy:
+                log.warning(
+                    f"Agent 2: Discrepancy in trustee_company across chunks. "
+                    f"Overwriting '{prior_trustee}' with '{trustee_company}' "
+                    f"from chunk {i+1}."
+                )
+
             if chunk_result.is_high_risk != is_high_risk:
                 log.warning(f"Agent 2: Discrepancy in is_high_risk across chunks. Overwriting '{is_high_risk}' with '{chunk_result.is_high_risk}' from chunk {i+1}.")
                 is_high_risk = chunk_result.is_high_risk

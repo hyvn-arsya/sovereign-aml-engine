@@ -64,7 +64,7 @@ I wrote tests that confirm both the positive case (nicknames now caught) **and**
 
 ## Engineering rigor
 
-- **16 unit tests** (8 pipeline + 8 CDK), all passing. The CDK tests synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn.
+- **19 tests** (11 pipeline + 8 CDK), all passing. The CDK tests synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn. The pipeline suite now also includes `test_moto_s3.py`, which runs the **real boto3 S3 code paths** (`gather_asic_data` and the audit-trail persistence in `run_pipeline`) against an in-process S3 mock — no AWS credentials or bucket needed. The same `put_object(..., ServerSideEncryption="aws:kms")` calls the pipeline makes in production execute for real against moto: the raw-upload path, the three audit artifacts (`extraction_output.json` / `screening_result.json` / `compliance_memo.txt`), and the KMS-at-rest encryption flag are all asserted. The external registry hop and the LLM agents are mocked; the S3 layer itself is what's under test.
 - **Async job queue**: screening takes 20–40s, so a blocking HTTP request is a production smell. Added `POST /analyze/abn/async` (202 + job id) with `GET /jobs/{id}` polling; the worker is factored to run behind SQS/Fargate.
 - **One-command demo**: `docker-compose up` brings up the FastAPI app + Postgres.
 - **Production-hardened AWS CDK**: S3 raw + versioned audit buckets, VPC + flow logs, encrypted RDS with backup retention, ECS Fargate behind an ALB with health checks, env-aware dev/prod.

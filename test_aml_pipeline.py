@@ -10,7 +10,9 @@ from aml_pipeline import (
     check_austrac_policy,
     load_dfat_sanctions,
     PEPApiError,
-    FUZZY_MATCH_THRESHOLD
+    FUZZY_MATCH_THRESHOLD,
+    _is_meaningful_trustee,
+    _reconcile_trustee,
 )
 
 def test_normalize_company_name():
@@ -157,3 +159,67 @@ def test_nickname_matching_avoids_false_positives():
         [{"name": "Alice Smith", "role": "Beneficiary"}], watchlist, "DFAT"
     )
     assert len(res) == 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# trustee_company chunk reconciliation (Agent 2 merge rule)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_is_meaningful_trustee():
+    """Real names are meaningful; empty and low-information values are not."""
+    assert _is_meaningful_trustee("Pemberton Advisory Pty Ltd") is True
+    assert _is_meaningful_trustee(" ACME Holdings Ltd ") is True
+    assert _is_meaningful_trustee("") is False
+    assert _is_meaningful_trustee(None) is False
+    # Placeholders that add no information must be rejected.
+    for placeholder in (
+        "Not specified", "unspecified", "Unknown", "Unknown Trustee",
+        "N/A", "none", "null", "not mentioned", "not stated",
+        "not found", "not provided", "  NA  ",
+    ):
+        assert _is_meaningful_trustee(placeholder) is False, placeholder
+
+
+def test_reconcile_trustee_placeholder_never_overwrites_concrete():
+    """A later 'Not specified' chunk must NOT erase a concrete trustee name."""
+    concrete = "Pemberton Advisory Pty Ltd"
+    new_value, discrepancy, skipped = _reconcile_trustee(concrete, "Not specified")
+    assert new_value == concrete
+    assert skipped is True
+    assert discrepancy is False
+
+
+def test_reconcile_trustee_first_concrete_value_is_set():
+    """The first concrete trustee value is adopted (no discrepancy logged)."""
+    new_value, discrepancy, skipped = _reconcile_trustee(None, "Pemberton Advisory Pty Ltd")
+    assert new_value == "Pemberton Advisory Pty Ltd"
+    assert discrepancy is False
+    assert skipped is False
+
+
+def test_reconcile_trustee_same_concrete_value_is_kept():
+    """Repeating the same concrete value across chunks is a no-op."""
+    new_value, discrepancy, skipped = _reconcile_trustee(
+        "Pemberton Advisory Pty Ltd", "Pemberton Advisory Pty Ltd"
+    )
+    assert new_value == "Pemberton Advisory Pty Ltd"
+    assert discrepancy is False
+    assert skipped is False
+
+
+def test_reconcile_trustee_different_concrete_value_overwrites():
+    """A genuinely different concrete value replaces the old one (flagged)."""
+    new_value, discrepancy, skipped = _reconcile_trustee(
+        "Pemberton Holdings Pty Ltd", "Pemberton Advisory Pty Ltd"
+    )
+    assert new_value == "Pemberton Advisory Pty Ltd"
+    assert discrepancy is True
+    assert skipped is False
+
+
+def test_reconcile_trustee_placeholder_alone_stays_unknown():
+    """If only placeholders arrive, no concrete trustee is ever adopted."""
+    new_value, discrepancy, skipped = _reconcile_trustee(None, "Not specified")
+    assert new_value is None
+    assert skipped is True
+    assert discrepancy is False
