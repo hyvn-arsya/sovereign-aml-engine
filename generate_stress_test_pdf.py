@@ -133,7 +133,7 @@ def add_original_deed(pdf: TrustBundlePDF):
     pdf.cell(0, 12, "THE PEMBERTON FAMILY TRUST", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(10)
     pdf.set_font("Helvetica", "", 12)
-    pdf.cell(0, 8, "ABN: 53 714 289 301", align="C", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 8, "ABN: 51 824 753 556", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.cell(0, 8, "Date of Settlement: 8 November 2017", align="C", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(15)
     pdf.cell(0, 8, "Prepared by:", align="C", new_x="LMARGIN", new_y="NEXT")
@@ -1423,7 +1423,7 @@ def add_filler_pages(pdf: TrustBundlePDF, target_pages: int):
              "of The Pemberton Family Trust, incorporating all variations to date:",
              "",
              "TRUST NAME: The Pemberton Family Trust",
-             "ABN: 53 714 289 301",
+             "ABN: 51 824 753 556",
              "CURRENT TRUSTEE: Pemberton Advisory Pty Ltd (ACN 672 831 059)",
              "APPOINTOR: Marcus Edward Pemberton",
              "GUARDIAN: Sarah Louise Pemberton",
@@ -1456,7 +1456,7 @@ def add_filler_pages(pdf: TrustBundlePDF, target_pages: int):
              "",
              "We, Parker & Associates Chartered Accountants, confirm that we have "
              "prepared the financial statements and tax returns for The Pemberton "
-             "Family Trust (ABN 53 714 289 301) for the financial year ended "
+             "Family Trust (ABN 51 824 753 556) for the financial year ended "
              "30 June 2024.",
              "",
              "We confirm that:",
@@ -1636,7 +1636,7 @@ def generate_full_bundle(output_path: str, target_pages: int = 108):
     print("GROUND TRUTH (for pipeline validation)")
     print("=" * 60)
     print(f"Trust Name:        The Pemberton Family Trust")
-    print(f"ABN:               53 714 289 301")
+    print(f"ABN:               51 824 753 556")
     print(f"")
     print(f"CURRENT Trustee:   Pemberton Advisory Pty Ltd (ACN 672 831 059)")
     print(f"  [Changed from Pemberton Holdings Pty Ltd on 01/02/2024]")
