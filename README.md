@@ -33,11 +33,12 @@ A 4-agent orchestration pipeline with deterministic screening at its core and LL
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Agent 1   DATA GATHERING          S3 upload, ABN format+checksum    │
-│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + Gemini 4.1 Pro        │
-│            (chunk & merge)         context-window guard, retries     │
+│  Agent 2   DOCUMENT EXTRACTION     LlamaParse + LLMProvider          │
+│            (chunk & merge)         default Gemini, local Ollama opt  │
 │  Agent 3   DETERMINISTIC SCREENING RapidFuzz vs DFAT sanctions + PEP │
 │            (no LLM)                name normalization, redaction      │
-│  Agent 4   REPORT DRAFTING         Claude Sonnet audit memo           │
+│  Agent 4   REPORT DRAFTING         LLMProvider — default Claude      │
+│            (memo drafting)         local Ollama option               │
 └─────────────────────────────────────────────────────────────────────┘
               │                                   │
               ▼                                   ▼
@@ -46,9 +47,9 @@ A 4-agent orchestration pipeline with deterministic screening at its core and LL
 ```
 
 - **Agent 1** — Validates the ABN (format + checksum) and retrieves ASIC company data; accepts a pre-uploaded S3 PDF.
-- **Agent 2** — Parses trust deeds with LlamaParse and extracts the ownership structure with Gemini. Oversized documents are chunked and truncated to fit the context window; each step has retry and error handling.
+- **Agent 2** — Parses trust deeds with LlamaParse and extracts the ownership structure through the **`LLMProvider`** seam (Gemini by default). Oversized documents are chunked and truncated to fit the context window; each step has retry and error handling.
 - **Agent 3** — The only mandated deterministic step. Normalizes entity names (`Acme Pty Ltd` → `acme`), fuzzy-matches all beneficiaries and the trustee company against the **DFAT sanctions list** (RapidFuzz, 85%+ threshold) and a PEP watchlist. PII is redacted in logs.
-- **Agent 4** — Drafts a comprehensive AUSTRAC compliance memo with Claude Sonnet, citing the full audit trail.
+- **Agent 4** — Drafts a comprehensive AUSTRAC compliance memo with Claude Sonnet (via the same `LLMProvider` seam), citing the full audit trail.
 
 The orchestrator (`run_pipeline`) coordinates the agents, assigns a deterministic reference number, persists an audit trail to S3 (7-year retention), and writes screening results to the database.
 
@@ -60,6 +61,7 @@ The orchestrator (`run_pipeline`) coordinates the agents, assigns a deterministi
 sovereign-aml-engine
 ├── api.py                    # FastAPI app (sync + async job endpoints)
 ├── aml_pipeline.py           # 4-agent pipeline orchestrator
+├── llm_provider.py           # LLMProvider seam (cloud default + local Ollama)
 ├── models.py                 # SQLAlchemy ORM models (incl. AnalysisJob)
 ├── database.py               # DB engine/session (SQLite local, Postgres/RDS)
 ├── init_db.py                # Create database tables
@@ -98,6 +100,8 @@ cp .env.example .env     # then fill in your LLM provider keys
 
 Required: `LLAMACLOUD_API_KEY`, `GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`.
 Without a `DB_HOST`, the app falls back to a local SQLite file — no database setup needed to get started.
+
+**LLM provider** (optional): the pipeline calls Gemini (extraction) and Claude (reporting) by default through the `LLMProvider` seam. To run extraction/reporting on a **self-hosted model** instead, set `LLM_PROVIDER=ollama` (plus `OLLAMA_BASE_URL` / `OLLAMA_MODEL`). If you use Ollama, you **must** size the model's context window to fit the pipeline's chunk size — set `OLLAMA_CONTEXT_LENGTH` on the server or bake `PARAMETER num_ctx <size>` into a custom Modelfile — otherwise over-length chunks are silently truncated (see `llm_provider.py`). The provider refuses to start with `OLLAMA_REQUIRE_CONTEXT=true` if the active context is too small.
 
 ### 3. Initialize the database
 
@@ -177,7 +181,7 @@ A standalone template (VPC, RDS, ECS Fargate, S3) provided as a reference altern
 ## Tech Stack
 
 - **API**: FastAPI, Uvicorn, Pydantic
-- **Agents**: LangChain + LlamaParse, Google Gemini, Anthropic Claude
+- **Agents**: LangChain + LlamaParse, via an **`LLMProvider` seam** — Google Gemini (extraction) and Anthropic Claude (reporting) by default, with a **self-hosted Ollama** option (`LLM_PROVIDER=ollama`)
 - **Screening**: RapidFuzz (deterministic, no LLM), curated given-name alias table
 - **Job queue**: In-process async jobs (`POST /analyze/abn/async`) + `GET /jobs/{id}` polling; worker ready to run on SQS/Fargate
 - **Storage**: SQLAlchemy (SQLite local / PostgreSQL), Amazon S3 (+ KMS encryption)

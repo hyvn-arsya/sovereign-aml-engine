@@ -72,10 +72,27 @@ I wrote tests that confirm both the positive case (nicknames now caught) **and**
 
 ---
 
+## Iteration: the `LLMProvider` seam (data sovereignty)
+
+The project's name promises a bank can keep trust deeds on infrastructure it controls — but Agents 2 and 4 originally constructed a hard-coded cloud model inline, so *every* document's PII went to Google/Anthropic regardless. The name was aspirational.
+
+Rather than promise this as a roadmap item, I built the minimal thing that makes it a **demonstrable claim**:
+
+- A small **`LLMProvider` protocol** with two call shapes that map exactly onto the two generative agents — `extract_structured(prompt, schema)` (Agent 2) and `generate_text(prompt)` (Agent 4). The pipeline no longer names a vendor; it names a seam.
+- **`CloudLLMProvider`** is the default and reproduces the prior Gemini/Claude behaviour bit-for-bit (a strict no-op — nothing about the default path changed).
+- **`OllamaLLMProvider`** is a second, working implementation that talks to a local model via plain `requests` against Ollama's OpenAI-compatible API — no vendor SDK. A local 7B model is *worse* at legal-document extraction than Gemini 3.1 Pro, and that's the accepted, documented cost of self-hosting. The point isn't parity — it's *proof the architecture doesn't lock you into a foreign cloud*.
+- Provider selection is an **admin-configured deployment decision** (`LLM_PROVIDER=cloud|ollama`), never a per-request user choice — consistent with ADR-001's argument that model choice in a compliance pipeline is governed.
+
+### The compliance bug the refactor surfaced
+
+Self-hosting introduced a trap I caught by checking Ollama's real API reference rather than trusting mocks: over-length input is **silently truncated** with no warning, and `num_ctx` can't be set through the OpenAI endpoint — it must be configured server-side. In a compliance pipeline that's a quiet data-loss gap: a chunk with beneficiaries A/B/C can be truncated to just C *while still returning a well-formed extraction*. So I added a **startup guard**: at construction the provider calls `/api/show` and compares the model's active context against the required minimum, logging a loud error — or refusing to start (`OLLAMA_REQUIRE_CONTEXT=true`) — when it's too small. And a reviewer caught that `/api/show` is **POST**, not GET (my mocked tests only patched whatever method the code called, so they couldn't catch the hard-coded wrong verb) — which, against a real server, would have silently no-oped the whole guard. Both are now fixed and verified with mocks patching the correct method.
+
+---
+
 ## What I learned / would do next
 
 - **Deterministic-vs-generative is a right answer worth defending** — interviewers responded well to an explicit, documented trade-off rather than a default "LLM everything".
-- **True data sovereignty for Agents 2 & 4**: right now "Sovereign AML" sends trust-deed PII to Google and Anthropic's clouds — the name is aspirational, not yet true. The next real iteration is an `LLMProvider` abstraction that Agents 2 (extraction) and 4 (reporting) call through, with the current Gemini/Claude calls as the default implementation and a self-hosted option (vLLM or Ollama serving an open-weight model) as a second. Provider selection stays an **admin-configured deployment decision**, never a per-request user choice — consistent with ADR-001's argument that model choice in a compliance pipeline is a governed decision, not a preference. This is what actually lets a bank keep confidential trust deeds on infrastructure they control, which is the whole point of the project's name.
+- **Data sovereignty for Agents 2 & 4 — now built, not a promise.** "Sovereign AML" no longer has to send trust-deed PII to a foreign cloud by construction: the `LLMProvider` seam (see the iteration below) lets a bank run extraction and reporting on infrastructure it controls, while staying on Gemini/Claude by default. The self-hosted option is a working seam, not a roadmap claim.
 - **Production data source**: wire the real DFAT consolidated list and a commercial PEP provider, and back the alias table with a reference-data vendor (transliteration variants of non-English names are a bigger real-world risk than Anglo nicknames).
 - **Truly async infra**: move the worker behind an SQS queue consumed by a separate Fargate task (the CDK stack is structured to accept it).
 - **Observability**: add structured audit-logging to S3 for the 7-year AUSTRAC retention requirement.
