@@ -50,13 +50,13 @@ import boto3
 import requests
 from botocore.exceptions import BotoCoreError, ClientError
 try:
-    from langchain_anthropic import ChatAnthropic
-    from langchain_google_genai import ChatGoogleGenerativeAI
     from llama_parse import LlamaParse
 except ImportError:
-    ChatAnthropic = ChatGoogleGenerativeAI = LlamaParse = None
+    LlamaParse = None
 from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
+
+from llm_provider import LLMProvider, get_provider
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -100,6 +100,17 @@ except Exception:
 CHUNK_SIZE = 60_000
 CHUNK_OVERLAP = 5_000
 EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-3.1-pro-preview")
+
+# LLM provider seam (Agent 2 / Agent 4). Resolved lazily once from the
+# admin-configured LLM_PROVIDER setting — see llm_provider.get_provider().
+_llm_provider: LLMProvider | None = None
+
+
+def _provider() -> LLMProvider:
+    global _llm_provider
+    if _llm_provider is None:
+        _llm_provider = get_provider()
+    return _llm_provider
 
 # ─────────────────────────────────────────────
 # SHARED S3 CLIENT (created once, reused)
@@ -370,14 +381,7 @@ def extract_trust_deed(s3_key: str) -> str:
 
     # ── CHUNK-AND-MERGE EXTRACTION ──────────────────────────────────────────
     chunks = _split_into_chunks(markdown_text)
-    log.info(f"Agent 2: Extracting entities across {len(chunks)} chunks using {EXTRACTION_MODEL}...")
-    
-    llm = ChatGoogleGenerativeAI(
-        model=EXTRACTION_MODEL,
-        temperature=0,
-        api_key=os.environ["GOOGLE_API_KEY"],
-    )
-    structured_llm = llm.with_structured_output(TrustDeedExtraction)
+    log.info(f"Agent 2: Extracting entities across {len(chunks)} chunks using {_provider().name}...")
 
     all_beneficiaries = []
     trust_name = None
@@ -396,7 +400,9 @@ Document Text Chunk:
 {chunk}
 """
         try:
-            chunk_result: TrustDeedExtraction = structured_llm.invoke(prompt)
+            chunk_result: TrustDeedExtraction = _provider().extract_structured(
+                prompt=prompt, output_schema=TrustDeedExtraction
+            )
             if chunk_result.trust_name and not trust_name:
                 trust_name = chunk_result.trust_name
             
@@ -733,12 +739,7 @@ def generate_audit_report(audit_trail: dict) -> str:
     """
     log.info("Agent 4: Drafting final compliance report...")
 
-    # NOTE: Model string updated to current Sonnet identifier.
-    # Check Anthropic docs for latest model string before deploying.
-    llm = ChatAnthropic(
-        model="claude-sonnet-5",
-        api_key=os.environ["ANTHROPIC_API_KEY"],
-    )
+    provider = _provider()
 
     has_flags = len(audit_trail["red_flags"]) > 0
     has_high_risk = audit_trail.get("is_high_risk_flag", False)
@@ -805,26 +806,9 @@ exactly as given — do not generate your own. Include date, subject line, body,
 and a signature block for the Compliance Officer.
 """
 
-    response = llm.invoke(prompt)
-    log.info("Agent 4: Report generation complete.")
-    # Handle newer langchain-anthropic versions where content is a list of blocks
-    content = response.content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            # Skip Claude's internal thinking blocks — not report content
-            if isinstance(block, dict) and block.get("type") == "thinking":
-                continue
-            if hasattr(block, "type") and getattr(block, "type", None) == "thinking":
-                continue
-            if isinstance(block, dict):
-                parts.append(block.get("text", str(block)))
-            elif hasattr(block, "text"):
-                parts.append(block.text)
-            else:
-                parts.append(str(block))
-        content = "\n".join(parts)
-    return content
+    memo = provider.generate_text(prompt=prompt)
+    log.info(f"Agent 4: Report generation complete using {provider.name}.")
+    return memo
 
 
 # ══════════════════════════════════════════════════════════════════════════════
