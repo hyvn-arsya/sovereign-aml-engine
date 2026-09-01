@@ -222,7 +222,7 @@ class OllamaLLMProvider:
         truncation hazard.
         """
         try:
-            resp = requests.get(
+            resp = requests.post(
                 f"{self._base_url}/api/show",
                 json={"model": self._model},
                 timeout=30,
