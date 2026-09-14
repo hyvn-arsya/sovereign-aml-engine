@@ -8,6 +8,7 @@ class Trust(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String, unique=True, index=True, nullable=True)  # Nullable for legacy rows
+    processing_key = Column(String, unique=True, index=True, nullable=True)  # Deterministic idempotency key
     reference_number = Column(String, unique=True, index=True)
     abn = Column(String, index=True, nullable=False)
     trust_name = Column(String, nullable=True)
@@ -69,3 +70,76 @@ class AnalysisJob(Base):
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class PipelineRun(Base):
+    """
+    Idempotent execution record for a single pipeline run (Priority 2).
+
+    One row per processing attempt; drives spot checks like
+    AVG(duration_ms), AVG(chunk_count), AVG(entity_count), SUM(red_flag_count)
+    over completed runs.
+    """
+
+    __tablename__ = "pipeline_runs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(String, unique=True, index=True)
+    processing_key = Column(String, index=True)  # Deterministic processing identity
+    abn = Column(String, index=True, nullable=False)
+    status = Column(String, index=True, default="running")  # running|completed|failed
+    chunk_count = Column(Integer, default=0)
+    entity_count = Column(Integer, default=0)
+    red_flag_count = Column(Integer, default=0)
+    duration_ms = Column(Integer, nullable=True)
+    started_at = Column(DateTime(timezone=True), server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+class Entity(Base):
+    """Canonical entity resolved from the trust deed (Priority 4)."""
+
+    __tablename__ = "entities"
+
+    id = Column(Integer, primary_key=True, index=True)
+    canonical_name = Column(String, index=True, nullable=False)
+    entity_type = Column(String, index=True)  # Beneficiary|Trustee|Appointor|Corporate
+    source_trust_id = Column(Integer, ForeignKey("trusts.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    aliases = relationship("EntityAlias", back_populates="entity", cascade="all, delete-orphan")
+    matches = relationship("ScreeningMatch", back_populates="entity", cascade="all, delete-orphan")
+
+
+class EntityAlias(Base):
+    """Alternative names for an entity (nicknames, diminutives, legal variants)."""
+
+    __tablename__ = "entity_aliases"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entity_id = Column(Integer, ForeignKey("entities.id"), index=True)
+    alias = Column(String, index=True, nullable=False)
+    alias_type = Column(String, default="nickname")  # nickname|diminutive|legal_variant
+
+    entity = relationship("Entity", back_populates="aliases")
+
+
+class ScreeningMatch(Base):
+    """
+    Persisted screening hit (Priority 4).
+
+    match_method distinguishes a direct name match from one that required
+    alias expansion (e.g. "Bob Smith" -> "Robert Smith").
+    """
+
+    __tablename__ = "screening_matches"
+
+    id = Column(Integer, primary_key=True, index=True)
+    entity_id = Column(Integer, ForeignKey("entities.id"), index=True)
+    watchlist_name = Column(String, index=True)
+    watchlist_type = Column(String)
+    match_score = Column(Float)
+    match_method = Column(String, index=True)  # direct|alias_expansion
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    entity = relationship("Entity", back_populates="matches")

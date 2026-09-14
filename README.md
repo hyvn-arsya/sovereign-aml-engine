@@ -55,6 +55,57 @@ The orchestrator (`run_pipeline`) coordinates the agents, assigns a deterministi
 
 ---
 
+## Architecture: Current vs Production
+
+The pipeline's *processing* agents are identical in both diagrams — the difference is the transport and worker topology of the envelope around them.
+
+```
+CURRENT IMPLEMENTATION (this repo)
+┌──────────────┐   200/500   ┌────────────────────┐    runs in-process    ┌──────────────┐
+│  FastAPI     │ ──────────► │  Background worker │ ────────────────────► │ run_pipeline │
+│  api.py      │             │  (BackgroundTasks/ │                      │  (4 agents)  │
+│              │             │   threading pool)  │                      └──────┬───────┘
+└──────────────┘             └────────────────────┘                             │
+         worker owns the scheduling: a request spawns a thread in the same      ▼
+         process as the API. Fine for a single instance / demo; does not   PostgreSQL + S3
+         survive crashes or scale beyond one process.
+```
+
+```
+PRODUCTION EVOLUTION (deployment target)
+┌──────────────┐  POST /analyze/abn/async   ┌──────────┐   pull   ┌──────────────────┐
+│  FastAPI     │ ─────────────────────────► │   SQS     │ ──────► │  ECS/Fargate     │
+│  (stateless) │ ◄───────────────────────── │ queue     │         │  worker (scale    │
+│              │   job_id + status polling  └──────────┘          │   to N tasks)     │
+└──────────────┘                                                  └────────┬─────────┘
+                                                                           ▼
+                                                                    PostgreSQL + S3
+```
+
+- **Current** — the FastAPI app runs the pipeline on a background task inside the API process. The `/analyze/abn/async` endpoint already returns a `job_id` immediately; the worker code is factored so it can be lifted onto SQS/Fargate as-is. Threads in a single process: fine for a load-tested single box, but a crash loses the in-flight job.
+- **Production** — the API becomes a thin, stateless submission layer: it enqueues an SQS message and the consumer polls a durable queue. A **durable queue + idempotent processing key** is what makes this safe: if the ECS worker is killed mid-run, its retry is *deduplicated* (same processing key → SKIP) instead of producing a duplicate result. Persistence (PostgreSQL + S3) is unchanged — only the delivery semantics change.
+- **Why not change it now?** The current in-process worker is behaviourally equivalent for one box, and the pipeline is already idempotent at the point the queue would retry it. SQS/Fargate adds durability and horizontal scale; it changes no processing logic.
+
+---
+
+## Data Engineering Design
+
+The screening logic is deliberately simple; the parts that matter operationally are the data-engineering decisions around how a screening *run* is identified, measured, and stored.
+
+- **Idempotency (content-addressed processing).** A run's identity is a deterministic `processing_key` — `sha256(document_hash | ABN | pipeline_version | extraction_model | screening_algorithm_version)`. Deleting all `run_id`-based logic: the same document + ABN + tool versions always resolves to the same key, so retries and duplicate submissions are recognised as replays and skipped, no matter what random `run_id` the caller issued. Bumping any version component (or uploading a revised deed) yields a genuinely new key and a legitimate re-process. This is *idempotent processing*, not exactly-once: a worker can still crash after an external side effect (e.g. the memo pushed downstream) and before recording completion — those are traceable through the audit trail rather than made impossible.
+
+- **Incremental processing.** Each run is self-contained (`PIPELINE_VERSION`, `EXTRACTION_MODEL`, `SCREENING_ALGORITHM_VERSION` are frozen into the processing key), so a batch re-screen after a model or sanctions-list upgrade is a fresh `processing_key`, not a mutation of history. Old results stay readable for audit; new results are additive.
+
+- **Entity resolution (promoted into the schema).** Nickname/diminutive alias expansion used to live only inside Agent 3's in-memory matching. It is now persisted: `entities` holds the canonical screened party, `entity_aliases` records the alias form that closed a match, and `screening_matches` records *how* the match happened (`direct` vs `alias_expansion`) for defensible audit.
+
+- **Data quality.** The screening threshold and the seed alias table are intentionally small and *known to be incomplete* (see the honesty note in the design decision section). The schema is built to survive upgrade: references are keyed by `entity_id` (not the raw name string), so canonical-name corrections propagate, and `match_method` makes true-signal vs alias-signal matches distinguishable at query time.
+
+- **Observability.** Every run lands in `pipeline_runs` with `started_at`, `completed_at`, `status`, `chunk_count`, `entity_count`, `red_flag_count`, and `duration_ms` — one row per attempt. Spot-check queries were tuned against this design, e.g. `SELECT AVG(duration_ms), AVG(entity_count), AVG(chunk_count), SUM(red_flag_count) FROM pipeline_runs WHERE status = 'completed'`. Skips (idempotent replays) and failed runs are represented so performance aggregates don't accidentally include wall-clock time for requests that did no work.
+
+- **Auditability.** AUSTRAC Part 11 record-keeping is the driver: every decision is either deterministic (Agent 3, scripted in the audit trail) or regenerable (Agent 4 memo is reconstructed from the same audit trail). The S3 trail (`extraction_output.json`, `screening_result.json`, `compliance_memo.txt`) and the relational rows are written in the same transaction story, encrypted with KMS.
+
+---
+
 ## Repository Layout
 
 ```
@@ -62,10 +113,11 @@ sovereign-aml-engine
 ├── api.py                    # FastAPI app (sync + async job endpoints)
 ├── aml_pipeline.py           # 4-agent pipeline orchestrator
 ├── llm_provider.py           # LLMProvider seam (cloud default + local Ollama)
-├── models.py                 # SQLAlchemy ORM models (incl. AnalysisJob)
+├── models.py                 # SQLAlchemy ORM models (Trust/PipelineRun/Entity/etc.)
 ├── database.py               # DB engine/session (SQLite local, Postgres/RDS)
 ├── init_db.py                # Create database tables
 ├── test_aml_pipeline.py      # Unit tests for screening logic
+├── test_priorities.py        # Idempotency + pipeline_runs + entity model (moto + in-memory SQLite)
 ├── test_moto_s3.py           # Moto-backed S3 integration tests (no AWS required)
 ├── Dockerfile                # Containerized FastAPI (uvicorn, port 8000)
 ├── docker-compose.yml        # App + PostgreSQL, one-command demo
@@ -148,6 +200,8 @@ python -m pytest infrastructure/tests     # CDK infrastructure tests
 ```
 
 The root suite includes `test_moto_s3.py`, which exercises the **real boto3 S3 code paths** in `aml_pipeline` — `gather_asic_data` (registry → upload) and the audit-trail persistence inside `run_pipeline` (`extraction_output.json`, `screening_result.json`, `compliance_memo.txt`, each encrypted with `aws:kms`) — against an **in-process S3 mock** (`moto`). No AWS credentials or bucket are needed: moto intercepts botocore's S3 requests at the transport layer, so the same `put_object` calls the pipeline makes in production run for real. The external registry HTTP and the LLM agents are mocked; the S3 layer itself is the thing under test.
+
+`test_priorities.py` goes one step further for the data-engineering layer: it runs the **real `run_pipeline`** against moto S3 **plus an in-memory SQLite DB** (with only the LLM agents mocked), asserting that (a) the deterministic `processing_key` skips a content replay under a fresh `run_id`, (b) a new document reprocesses normally, and (c) `pipeline_runs`, `entities`, `entity_aliases`, and `screening_matches` rows land with correct runtime metrics and `match_method` tags.
 
 To verify the S3 layer locally, run the moto-backed tests alone:
 

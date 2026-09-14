@@ -33,6 +33,7 @@ Fixed Issues (v2):
 """
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -101,6 +102,31 @@ CHUNK_SIZE = 60_000
 CHUNK_OVERLAP = 5_000
 EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-3.1-pro-preview")
 
+# Version pins that participate in the deterministic processing key (Priority 1).
+# Bumping any of these (or the extraction/screening agent versions) changes the
+# processing identity, so a re-run is treated as a NEW processing request rather
+# than an idempotent replay of an old result.
+PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "0.1.0")
+SCREENING_ALGORITHM_VERSION = os.environ.get("SCREENING_ALGORITHM_VERSION", "1")
+
+# Candidate/placeholder role strings for a trustee that never extracted a
+# concrete trustee entity — used by the chunk-merge reconciliation in Agent 2.
+_TRUSTEE_PLACEHOLDERS = frozenset(
+    {
+        "not specified",
+        "not provided",
+        "none specified",
+        "none provided",
+        "nil",
+        "n/a",
+        "na",
+        "-",
+        "unknown",
+        "unavailable",
+        "placeholder",
+    }
+)
+
 # LLM provider seam (Agent 2 / Agent 4). Resolved lazily once from the
 # admin-configured LLM_PROVIDER setting — see llm_provider.get_provider().
 _llm_provider: LLMProvider | None = None
@@ -111,6 +137,47 @@ def _provider() -> LLMProvider:
     if _llm_provider is None:
         _llm_provider = get_provider()
     return _llm_provider
+
+
+# ─────────────────────────────────────────────
+# PRIORITY 1: DETERMINISTIC PROCESSING KEY (IDEMPOTENCY)
+# ─────────────────────────────────────────────
+def _document_sha256(s3_key: str) -> str:
+    """SHA-256 of the raw document bytes as stored in S3."""
+    obj = s3.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    return hashlib.sha256(obj["Body"].read()).hexdigest()
+
+
+def compute_processing_key(
+    company_abn: str,
+    document_sha256_hex: str,
+    pipeline_version: str = PIPELINE_VERSION,
+    extraction_model: str = EXTRACTION_MODEL,
+    screening_algorithm_version: str = SCREENING_ALGORITHM_VERSION,
+) -> str:
+    """
+    Deterministic identity of ONE processing request.
+
+    Two runs of the same document + ABN + tool versions produce the same key,
+    so a retry is an idempotent replay (SKIP) rather than a duplicate. Changing
+    any component — a new document, a different ABN, a model upgrade — yields a
+    NEW key and a legitimate re-process.
+
+    This is idempotency, NOT exactly-once: a worker can still crash after an
+    external side effect (e.g. the memo pushed to a downstream channel) and
+    before recording completion. The audit trail + pipeline_runs row make that
+    traceable.
+    """
+    raw = "|".join(
+        [
+            document_sha256_hex,
+            company_abn,
+            pipeline_version,
+            extraction_model,
+            screening_algorithm_version,
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 # ─────────────────────────────────────────────
 # SHARED S3 CLIENT (created once, reused)
@@ -379,11 +446,16 @@ def _reconcile_trustee(current: Optional[str], incoming: Optional[str]):
     return incoming, bool(current), False
 
 
-def extract_trust_deed(s3_key: str) -> str:
+def extract_trust_deed(s3_key: str, stats: Optional[dict] = None) -> str:
     """
     Downloads the PDF from S3, writes it to a temp file, parses it with
     LlamaParse, then uses Gemini (EXTRACTION_MODEL) to extract structured data
     from each chunk. Results are merged with deduplication.
+
+    Args:
+        s3_key: S3 key of the trust deed PDF.
+        stats:  Optional dict populated with runtime metrics for the calling
+                orchestrator (currently: ``chunk_count``).
 
     Returns: JSON string (not a Pydantic object) — ready for Agent 3.
     """
@@ -429,6 +501,8 @@ def extract_trust_deed(s3_key: str) -> str:
 
     # ── CHUNK-AND-MERGE EXTRACTION ──────────────────────────────────────────
     chunks = _split_into_chunks(markdown_text)
+    if stats is not None:
+        stats["chunk_count"] = len(chunks)
     log.info(f"Agent 2: Extracting entities across {len(chunks)} chunks using {_provider().name}...")
 
     all_beneficiaries = []
@@ -694,6 +768,7 @@ def _screen_entities(
             direct_score = fuzz.token_set_ratio(norm_entity, norm_watch)
             best_score = direct_score
             alias_used = None
+            alias_form = None
 
             # If the direct match misses the threshold, try expanding either
             # side's given names against the other to catch nickname/diminutive
@@ -707,6 +782,7 @@ def _screen_entities(
                     if score > best_score:
                         best_score = score
                         alias_used = f"{watchlist_label} alias expansion"
+                        alias_form = cand
                 # Expand the watchlist's given names; compare each form to the
                 # entity name.
                 for cand in watch_forms:
@@ -714,6 +790,7 @@ def _screen_entities(
                     if score > best_score:
                         best_score = score
                         alias_used = f"{watchlist_label} alias expansion"
+                        alias_form = cand
 
             if best_score >= FUZZY_MATCH_THRESHOLD:
                 flag = {
@@ -726,6 +803,8 @@ def _screen_entities(
                 }
                 if alias_used:
                     flag["match_reason"] = alias_used
+                    if alias_form:
+                        flag["match_alias"] = alias_form
                 flags.append(flag)
     return flags
 
@@ -949,27 +1028,84 @@ def run_pipeline(
             "Request the document directly from the client."
         )
 
-    # ── AGENT 2: Extract (with retry) ─────────────────────────────────────────
-    import httpx
-    from google.api_core.exceptions import RetryError, GoogleAPIError
-    extracted_json = None
-    for attempt in range(1, max_retries + 2):
+    # ── PRIORITY 1: Deterministic processing key (content-based idempotency) ──
+    # The processing identity is a hash of the DOCUMENT ITSELF, the ABN, and the
+    # tool versions — not the caller-supplied run_id. Repeating the same request
+    # with a fresh run_id still recognises it as a replay and skips it.
+    processing_key = None
+    try:
+        document_hash = _document_sha256(s3_key)
+        processing_key = compute_processing_key(company_abn, document_hash)
+        log.debug(f"Pipeline: processing_key={processing_key}")
+    except (BotoCoreError, ClientError) as exc:
+        # If the document cannot be read we cannot fingerprint it. The pipeline
+        # will fail loudly in Agent 2 anyway; degrade gracefully here.
+        log.warning(f"Pipeline: Could not compute processing key — {exc}")
+
+    if db is not None and processing_key:
         try:
-            extracted_json = extract_trust_deed(s3_key)
-            break
-        except (requests.exceptions.RequestException, httpx.RequestError, RetryError, GoogleAPIError) as exc:
-            if attempt <= max_retries:
-                wait = 2 ** attempt
-                log.warning(
-                    f"Agent 2 attempt {attempt} failed ({exc}). Retrying in {wait}s..."
+            from models import Trust
+            existing = db.query(Trust).filter(Trust.processing_key == processing_key).first()
+            if existing:
+                log.info(
+                    f"Pipeline SKIPPED — content-based replay for processing_key "
+                    f"{processing_key[:12]}… already processed under reference "
+                    f"{existing.reference_number}"
                 )
-                time.sleep(wait)
-            else:
-                log.error("Agent 2: All retry attempts exhausted.")
-                raise
+                return f"SKIPPED: Already processed under reference {existing.reference_number}"
+        except Exception as e:
+            log.warning(f"Failed to check processing-key idempotency: {e}")
+
+    # ── PRIORITY 2: Open an observability record for this run ─────────────────
+    pipeline_run = None
+    pipeline_started = None
+    if db is not None:
+        try:
+            from models import PipelineRun
+            pipeline_started = datetime.now(AEST)
+            pipeline_run = PipelineRun(
+                run_id=run_id,
+                processing_key=processing_key,
+                abn=company_abn,
+                status="running",
+                started_at=pipeline_started,
+            )
+            db.add(pipeline_run)
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            log.warning(f"Pipeline: Could not open pipeline_runs record — {exc}")
+            pipeline_run = None
+
+    # ── AGENT 2: Extract (with retry) ─────────────────────────────────────────
+    extraction_stats: dict = {}
+    try:
+        import httpx
+        from google.api_core.exceptions import RetryError, GoogleAPIError
+        extracted_json = None
+        for attempt in range(1, max_retries + 2):
+            try:
+                extracted_json = extract_trust_deed(s3_key, stats=extraction_stats)
+                break
+            except (requests.exceptions.RequestException, httpx.RequestError, RetryError, GoogleAPIError) as exc:
+                if attempt <= max_retries:
+                    wait = 2 ** attempt
+                    log.warning(
+                        f"Agent 2 attempt {attempt} failed ({exc}). Retrying in {wait}s..."
+                    )
+                    time.sleep(wait)
+                else:
+                    log.error("Agent 2: All retry attempts exhausted.")
+                    raise
+    except Exception:
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
+        raise
 
     # FIX #2: Guard against None (defensive — the raise above should prevent this)
     if extracted_json is None:
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
         raise RuntimeError(
             "Agent 2 failed to produce extraction output after all attempts."
         )
@@ -986,14 +1122,29 @@ def run_pipeline(
     except (BotoCoreError, ClientError) as exc:
         log.warning(f"Pipeline: Failed to persist extraction checkpoint — {exc}")
         # Non-fatal: pipeline continues even if checkpoint write fails
+    except Exception:
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
+        raise
 
     # ── AGENT 3: Screen ───────────────────────────────────────────────────────
-    dfat_db = load_dfat_sanctions()
-    audit_trail = check_austrac_policy(extracted_json, dfat_db)
+    try:
+        dfat_db = load_dfat_sanctions()
+        audit_trail = check_austrac_policy(extracted_json, dfat_db)
+    except Exception:
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
+        raise
 
     # FIX #8: Inject reference number into audit trail for Agent 4
     audit_trail["reference_number"] = reference_number
     audit_trail["run_id"] = run_id
+
+    # PRIORITY 2: Feed encoding/runtime metrics into the pipeline_runs row
+    if pipeline_run is not None:
+        pipeline_run.chunk_count = extraction_stats.get("chunk_count", 0)
+        pipeline_run.entity_count = audit_trail.get("total_entities_checked", 0)
+        pipeline_run.red_flag_count = len(audit_trail.get("red_flags", []))
 
     # FIX #7: Persist screening results (required for 7-year retention)
     try:
@@ -1011,6 +1162,8 @@ def run_pipeline(
     except (BotoCoreError, ClientError) as exc:
         # Audit persistence failure IS fatal — we cannot proceed without
         # a durable record of the screening decision.
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
         log.error(f"Pipeline: FATAL — Failed to persist screening results — {exc}")
         raise RuntimeError(
             "Cannot continue pipeline: audit trail persistence failed. "
@@ -1037,20 +1190,33 @@ def run_pipeline(
         log.warning(f"Pipeline: Failed to persist compliance memo — {exc}")
         # Non-fatal: the screening result (the legally critical part) is already saved.
         # The memo can be regenerated from the screening result if needed.
+    except Exception:
+        if pipeline_run is not None and db is not None:
+            _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
+        raise
 
     # ── PHASE 5: Persist to Relational Database ───────────────────────────────
     if db is not None:
         try:
             # Import models locally to avoid circular imports
-            from models import Trust, Beneficiary, RedFlag, ComplianceReport
-            
-            # The extraction json was safely loaded earlier, we'll re-parse it here 
+            from models import (
+                Trust,
+                Beneficiary,
+                RedFlag,
+                ComplianceReport,
+                Entity,
+                EntityAlias,
+                ScreeningMatch,
+            )
+
+            # The extraction json was safely loaded earlier, we'll re-parse it here
             # for clarity, or just use the audit_trail
             extracted_data = json.loads(extracted_json)
-            
+
             # 1. Create the parent Trust record
             trust_record = Trust(
                 run_id=run_id,
+                processing_key=processing_key,
                 reference_number=reference_number,
                 abn=company_abn,
                 trust_name=extracted_data.get("trust_name"),
@@ -1059,11 +1225,11 @@ def run_pipeline(
             )
             db.add(trust_record)
             db.flush()  # Flush to auto-generate the trust_record.id
-            
+
             # 2. Add Beneficiaries
             for b_name in extracted_data.get("beneficiaries", []):
                 db.add(Beneficiary(trust_id=trust_record.id, name=b_name, role="Beneficiary"))
-                
+
             # 3. Add Red Flags
             for flag in audit_trail.get("red_flags", []):
                 db.add(RedFlag(
@@ -1073,14 +1239,59 @@ def run_pipeline(
                     match_score=flag.get("match_confidence_score"),
                     action_required=flag.get("action_required")
                 ))
-                
+
             # 4. Add Final Report
             db.add(ComplianceReport(
                 trust_id=trust_record.id,
                 report_text=final_memo,
                 s3_key=f"{AUDIT_LOG_PREFIX}/{run_id}/compliance_memo.txt"
             ))
-            
+
+            # ── PRIORITY 4: Resolve canonical entities + persist aliases ──
+            # Every screened party becomes an Entity row; the nickname/alias
+            # expansion that Agent 3 had been doing in-memory is now persisted:
+            # when a match was only possible via a given-name alias, that alias
+            # is recorded as an EntityAlias and the match is tagged as
+            # match_method='alias_expansion'.
+            entities_by_name: dict[str, Entity] = {}
+
+            def _entity_for(name: str, entity_type: str) -> Entity:
+                key = (name or "").strip().lower()
+                if key in entities_by_name:
+                    return entities_by_name[key]
+                entity = Entity(canonical_name=name, entity_type=entity_type)
+                db.add(entity)
+                db.flush()
+                entities_by_name[key] = entity
+                return entity
+
+            for b_name in extracted_data.get("beneficiaries", []):
+                _entity_for(b_name, "Beneficiary")
+            if extracted_data.get("trustee_company"):
+                _entity_for(extracted_data["trustee_company"], "Trustee")
+
+            for flag in audit_trail.get("red_flags", []):
+                ent = _entity_for(
+                    flag.get("extracted_name"),
+                    flag.get("extracted_role") or "Beneficiary",
+                )
+                reason = flag.get("match_reason") or ""
+                match_method = "alias_expansion" if "alias expansion" in reason else "direct"
+                db.add(ScreeningMatch(
+                    entity_id=ent.id,
+                    watchlist_name=flag.get("matched_watchlist_name"),
+                    watchlist_type=flag.get("watchlist_type"),
+                    match_score=flag.get("match_confidence_score"),
+                    match_method=match_method,
+                ))
+                alias_form = flag.get("match_alias")
+                if match_method == "alias_expansion" and alias_form:
+                    db.add(EntityAlias(
+                        entity_id=ent.id,
+                        alias=alias_form,
+                        alias_type="given_name_variant",
+                    ))
+
             db.commit()
             log.info(f"Pipeline: Successfully persisted Trust {trust_record.id} to relational database.")
         except ImportError as exc:
@@ -1088,6 +1299,8 @@ def run_pipeline(
             log.error(f"Pipeline: Config error, missing DB models — {exc}")
         except Exception as exc:
             db.rollback()
+            if pipeline_run is not None and db is not None:
+                _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
             # Handle SQLAlchemy IntegrityError explicitly safely without direct import if it fails
             if "IntegrityError" in type(exc).__name__:
                 log.info(f"Pipeline: Race condition mitigated, Trust with run_id {run_id} already exists.")
@@ -1095,8 +1308,41 @@ def run_pipeline(
                 log.error(f"Pipeline: Failed to persist to relational database — {exc}")
                 raise RuntimeError("Database persistence failed; failing closed") from exc
 
+    # PRIORITY 2: Mark the run completed (durable, near-zero writes).
+    if pipeline_run is not None and db is not None:
+        try:
+            pipeline_run.status = "completed"
+            pipeline_run.completed_at = datetime.now(AEST)
+            if pipeline_started is not None:
+                pipeline_run.duration_ms = int(
+                    (pipeline_run.completed_at - pipeline_started).total_seconds() * 1000
+                )
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            log.warning(f"Pipeline: Could not finalise pipeline_runs record — {exc}")
+
     log.info(f"Pipeline COMPLETE — Run ID {run_id}")
     return final_memo
+
+
+def _mark_pipeline_run_failed(
+    db: Session,
+    pipeline_run,
+    pipeline_started,
+) -> None:
+    """Best-effort transition of a PipelineRun row to status='failed'."""
+    try:
+        pipeline_run.status = "failed"
+        pipeline_run.completed_at = datetime.now(AEST)
+        if pipeline_started is not None:
+            pipeline_run.duration_ms = int(
+                (pipeline_run.completed_at - pipeline_started).total_seconds() * 1000
+            )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        log.warning(f"Pipeline: Could not record failed pipeline_runs entry — {exc}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

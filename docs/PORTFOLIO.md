@@ -4,7 +4,7 @@ A 4-agent AI pipeline for **AML/KYC beneficial-ownership screening** of Australi
 
 - **Code:** [`hyvn-arsya/sovereign-aml-engine`](https://github.com/hyvn-arsya/sovereign-aml-engine)
 - **Stack:** Python · FastAPI · LangChain (LlamaParse, Gemini, Claude) · RapidFuzz · SQLAlchemy · AWS CDK · Docker
-- **Tests:** 8 pipeline + 8 CDK unit tests, all green
+- **Tests:** 28 pipeline/S3/data-model tests + 8 CDK unit tests, all green
 
 ---
 
@@ -64,7 +64,9 @@ I wrote tests that confirm both the positive case (nicknames now caught) **and**
 
 ## Engineering rigor
 
-- **19 tests** (11 pipeline + 8 CDK), all passing. The CDK tests synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn. The pipeline suite now also includes `test_moto_s3.py`, which runs the **real boto3 S3 code paths** (`gather_asic_data` and the audit-trail persistence in `run_pipeline`) against an in-process S3 mock — no AWS credentials or bucket needed. The same `put_object(..., ServerSideEncryption="aws:kms")` calls the pipeline makes in production execute for real against moto: the raw-upload path, the three audit artifacts (`extraction_output.json` / `screening_result.json` / `compliance_memo.txt`), and the KMS-at-rest encryption flag are all asserted. The external registry hop and the LLM agents are mocked; the S3 layer itself is what's under test.
+- **28 root tests** (14 pipeline unit + 3 moto S3 + 11 data-engineering), all passing, plus 8 CDK tests that synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn. The strip of the pipeline everyone worries about is the storage layer, so two of the suites put it under real test:
+  - `test_moto_s3.py` runs the **real boto3 S3 code paths** (`gather_asic_data` and the audit-trail persistence in `run_pipeline`) against an in-process S3 mock — no AWS credentials or bucket needed. The same `put_object(..., ServerSideEncryption="aws:kms")` calls the pipeline makes in production execute for real against moto: the raw-upload path, the three audit artifacts (`extraction_output.json` / `screening_result.json` / `compliance_memo.txt`), and the KMS-at-rest encryption flag are all asserted. The external registry hop and the LLM agents are mocked; the S3 layer itself is what's under test.
+  - `test_priorities.py` runs the **real `run_pipeline`** against moto S3 **plus an in-memory SQLite database** (only the LLM agents mocked). It proves the deterministic `processing_key` skips a re-screening of the same document *under a fresh `run_id`* while a genuinely new document reprocesses; that `pipeline_runs` captures `chunk_count` / `entity_count` / `red_flag_count` / `duration_ms`; and that the entity model persists `entities`, `entity_aliases`, and `screening_matches` tagged `direct` vs `alias_expansion`.
 - **Async job queue**: screening takes 20–40s, so a blocking HTTP request is a production smell. Added `POST /analyze/abn/async` (202 + job id) with `GET /jobs/{id}` polling; the worker is factored to run behind SQS/Fargate.
 - **One-command demo**: `docker-compose up` brings up the FastAPI app + Postgres.
 - **Production-hardened AWS CDK**: S3 raw + versioned audit buckets, VPC + flow logs, encrypted RDS with backup retention, ECS Fargate behind an ALB with health checks, env-aware dev/prod.
@@ -89,13 +91,25 @@ Self-hosting introduced a trap I caught by checking Ollama's real API reference 
 
 ---
 
+## Iteration: the data-engineering layer (idempotency, runs, entities)
+
+A screening pipeline that works end-to-end in a demo is not yet a defensible data product. I tightened the layer underneath it along four axes that interviewers and reviewers tend to push on hardest:
+
+- **Content-addressed idempotency (replacing run_id-based).** The old dedup keyed on a caller-supplied `run_id` — trivially defeated by retrying with a fresh UUID. The processing identity is now a deterministic `processing_key = sha256(document_hash | ABN | pipeline_version | extraction_model | screening_algorithm_version)`. Same document + same ABN + same tool versions ⇒ same key ⇒ replay, **whatever the caller's run_id**. New document, upgraded model, or bumped screening algorithm ⇒ genuinely new key ⇒ legitimate re-process. I was careful not to overclaim: this is *idempotent processing*, not exactly-once — a worker can still crash after an external side effect and before recording completion, and the way you catch that is the audit trail, not a queue fairy tale (see below).
+- **`pipeline_runs` observability.** One row per run with `started_at`, `completed_at`, `status`, `chunk_count`, `entity_count`, `red_flag_count`, `duration_ms`. That turns a demo into something you can query: `SELECT AVG(duration_ms), AVG(chunk_count), AVG(entity_count), SUM(red_flag_count) FROM pipeline_runs WHERE status = 'completed'`. Skips and failures are represented distinctly so the aggregates measure real work.
+- **Entity resolution promoted into the schema.** The nickname/alias expansion that used to live only inside Agent 3's in-memory matching is now persisted: `entities` (canonical screened party), `entity_aliases` (the alias form that closed a match), and `screening_matches` (with `match_method` = `direct` | `alias_expansion`). Audit trails don't help if they can't be re-examined structurally.
+- **Explicit routing table for the envelope (Current vs Production).** The README now contrasts the in-process background worker (current, single-box truthful) with the SQS → ECS/Fargate worker (production target) and states plainly that only the *delivery* semantics change, not the processing logic — and why that matters (a durable queue without content-based dedup would still duplicate results).
+
+---
+
 ## What I learned / would do next
 
 - **Deterministic-vs-generative is a right answer worth defending** — interviewers responded well to an explicit, documented trade-off rather than a default "LLM everything".
 - **Data sovereignty for Agents 2 & 4 — now built, not a promise.** "Sovereign AML" no longer has to send trust-deed PII to a foreign cloud by construction: the `LLMProvider` seam (see the iteration below) lets a bank run extraction and reporting on infrastructure it controls, while staying on Gemini/Claude by default. The self-hosted option is a working seam, not a roadmap claim.
 - **Production data source**: wire the real DFAT consolidated list and a commercial PEP provider, and back the alias table with a reference-data vendor (transliteration variants of non-English names are a bigger real-world risk than Anglo nicknames).
 - **Truly async infra**: move the worker behind an SQS queue consumed by a separate Fargate task (the CDK stack is structured to accept it).
-- **Observability**: add structured audit-logging to S3 for the 7-year AUSTRAC retention requirement.
+- **Observability — now built, not a roadmap item.** Every run lands in `pipeline_runs` (`started_at`, `completed_at`, `status`, `chunk_count`, `entity_count`, `red_flag_count`, `duration_ms`), feeding the kind of spot-check query a reviewer actually writes: `SELECT AVG(duration_ms), AVG(entity_count), AVG(chunk_count), SUM(red_flag_count) FROM pipeline_runs WHERE status = 'completed'`.
+- **Idempotency claims stay honest.** The processing key buys idempotent replays, not exactly-once: a worker can still crash after pushing a memo downstream and before recording completion. I document that distinction in the README rather than papering over it — it's the difference between a defensible claim and one an interviewer can dismantle.
 
 ---
 
