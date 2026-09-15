@@ -26,7 +26,37 @@ log = logging.getLogger("aml_api")
 # ─────────────────────────────────────────
 # Keys are stored as salted SHA-256 hashes; the plaintext is never persisted.
 # Rotate by issuing a new key and deactivating the old one.
-_API_KEY_SALT = os.environ.get("API_KEY_SALT", "sovereign-aml-dev-salt")
+_DEV_API_KEY_SALT = "sovereign-aml-dev-salt"
+_API_KEY_SALT = os.environ.get("API_KEY_SALT", _DEV_API_KEY_SALT)
+
+
+def _is_production_runtime(environ) -> bool:
+    """True when the runtime is production-shaped (production screening mode or
+    a non-development env tag). Local defaults keep development ergonomic."""
+    if environ.get("SCREENING_MODE", "demo") == "production":
+        return True
+    env = environ.get("ENV", "development").lower()
+    return env not in ("dev", "development")
+
+
+def _validate_production_config(environ=None) -> None:
+    """
+    SECURITY REVIEW (P2): outside development, refuse to start when the API-key
+    salt is missing or still the checked-in development default. An attacker
+    with the repo could otherwise recompute any stored key hash (deterministic
+    sha256(key + known salt). NotImplemented shutdown, not a warning.
+    """
+    environ = environ if environ is not None else os.environ
+    if not _is_production_runtime(environ):
+        return
+    salt = environ.get("API_KEY_SALT")
+    if not salt or salt == _DEV_API_KEY_SALT:
+        raise RuntimeError(
+            "Refusing to start: API_KEY_SALT is required outside development "
+            "and must not be the checked-in development default. Generate a "
+            "random value and inject it via Secrets Manager (CDK injects it as "
+            "API_KEY_SALT from the operator-provisioned app secret)."
+        )
 
 
 def _hash_api_key(key: str) -> str:
@@ -71,7 +101,10 @@ def seed_api_keys_from_env(db: Session) -> int:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Seed API keys from environment at startup (best-effort)."""
+    """Validate production security config, then seed API keys at startup."""
+    # SECURITY REVIEW: fail closed — never boot a production process with the
+    # dev salt (or no salt). Raises, and startup aborts, before any traffic.
+    _validate_production_config()
     try:
         db = SessionLocal()
         try:
@@ -92,7 +125,7 @@ app = FastAPI(
         "structures.  Supports both synchronous (blocking) and asynchronous "
         "(job-queue) modes."
     ),
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -198,11 +231,19 @@ def _run_worker(job_id: str, abn: str, s3_key: str | None) -> None:
         job.status = "running"
         db.commit()
 
+        # SECURITY REVIEW (tenant isolation): the pipeline must scope its
+        # processing key and persisted trust record by the job's tenant.
+        tenant = None
+        if job.tenant_id is not None:
+            tenant = db.query(Tenant).filter(Tenant.id == job.tenant_id).first()
+
         memo = run_pipeline(
             company_abn=abn,
             pre_uploaded_s3_key=s3_key,
             max_retries=2,
             db=db,
+            tenant_id=tenant.id if tenant is not None else None,
+            tenant_name=tenant.name if tenant is not None else None,
         )
         job.compliance_memo = memo
         # SECURITY REVIEW: an incomplete screen is an explicit BLOCKED outcome,
@@ -262,6 +303,8 @@ def analyze_entity(
             pre_uploaded_s3_key=request.pre_uploaded_s3_key,
             max_retries=2,
             db=db,
+            tenant_id=tenant.id,
+            tenant_name=tenant.name,
         )
         # SECURITY REVIEW: surface the blocked/manual-review outcome explicitly.
         if report_markdown.startswith(BLOCKED_PREFIX):

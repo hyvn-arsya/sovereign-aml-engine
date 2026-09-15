@@ -1,5 +1,27 @@
 # Releases
 
+## v0.3.0-alpha
+
+**Follow-up security review — 6 findings (2 Critical, 3 High, 1 Low) on the *deployed* system, with regression tests, CDK assertions, and a verified migration chain.**
+
+### What shipped
+
+- **Tenant data isolation (Critical)** — idempotency no longer leaks across tenants: `processing_key = sha256(... | tenant)` diverges byte-identical deeds per tenant, and the persisted audit trail carries `trusts.tenant_id`. Tenant identity is threaded end-to-end from API key → `run_pipeline(tenant_id, tenant_name)` → claim → trust record.
+- **Operator-provisioned secrets, deploy-fail-closed (Critical)** — the CDK prod stack **refuses to synthesize** without `-c llm_credentials_arn` and `-c app_secrets_arn` (or `LLM_CREDENTIALS_ARN` / `APP_SECRETS_ARN`). The generated `LlmCredentials` placeholder secret is gone. App config (`API_KEY_SALT`, `SEED_API_KEYS`, `DFAT_SOURCE_URL`, `PEP_API_KEY`) is injected from an operator secret; `SCREENING_MODE` is pinned `production`/`demo` per env.
+- **Migrations as a one-off run-task (High)** — the serving container never runs migrations at startup. A dedicated Fargate task (`alembic upgrade head`) shares the image + DB secret and has its own security group, log group, and CDK outputs (`MigrationTaskDefinitionFamily`, `MigrationTaskSecurityGroupId`); README documents the `aws ecs run-task` invocation. New migration `57cdbc23dd16 add tenant scoping to trusts` verified `upgrade head` → `downgrade` against a fresh DB.
+- **Failed-run retry (High)** — a terminal `failed` claim is released so the document can be re-claimed and re-processed; the failed attempt stays as audit history (claim cleared). Active/completed/blocked claims still block.
+- **DFAT unavailable → blocked, not failed (High)** — `load_dfat_sanctions` errors resolve to the deterministic `BLOCKED — MANUAL REVIEW REQUIRED` outcome with a `screening_incomplete`/`dfat_unavailable_reason` audit trail, mirroring the existing PEP fail-closed path.
+- **Production salt enforcement (Low)** — outside development, startup refuses if `API_KEY_SALT` is missing or still the checked-in dev default.
+- **Order-independent test DB isolation** — new root `conftest.py` pins `DATABASE_URL` before any module import, fixing a collection-order-sensitive bug where `database` could bind to a stale dev file.
+
+### Test suite (53 root + 11 CDK, all green; 1 dev-only root test skipped)
+
+- `test_priorities.py` +5 (tenant-scoped processing keys; failed-run re-claim lifecycle; DFAT-unavailable blocked outcome with tenant-scoped trust)
+- `test_api_auth.py` +2 (sync endpoint passes tenant identity to the pipeline; production runtime requires a real salt)
+- CDK +3 (prod synthesis throws without operator ARNs; prod task gets `SCREENING_MODE=production` + app-config secrets; the only command override in the stack is the alembic migration task)
+
+---
+
 ## v0.2.0-alpha
 
 **Security review — 7 findings triaged and fixed in one pass, with regression tests and CDK assertions.**

@@ -594,3 +594,128 @@ def test_demo_mode_returns_mocks_by_default():
     with patch.dict(os.environ, {"PEP_API_KEY": ""}, clear=False):
         peps = load_pep_list()
     assert any(p["type"].startswith("PEP") for p in peps)
+
+
+def test_processing_key_is_tenant_scoped():
+    """
+    SECURITY (P0): idempotency must not leak across tenants. Byte-identical
+    deeds submitted by DIFFERENT tenants get DIFFERENT processing keys, so one
+    tenant's run can never be skipped (its reference adopted) on the basis of
+    another tenant's result. Same tenant -> same key (idempotent replay).
+    """
+    from aml_pipeline import compute_processing_key
+
+    doc_hash = "aa" * 32
+    key_acme_1 = compute_processing_key(VALID_ABN, doc_hash, tenant_id="acme-corp")
+    key_acme_2 = compute_processing_key(VALID_ABN, doc_hash, tenant_id="acme-corp")
+    key_bank = compute_processing_key(VALID_ABN, doc_hash, tenant_id="big-bank")
+    key_legacy = compute_processing_key(VALID_ABN, doc_hash)
+
+    assert key_acme_1 == key_acme_2
+    assert key_acme_1 != key_bank
+    # Tenant-scoped keys never collide with the legacy (unscoped) key shape.
+    assert key_acme_1 != key_legacy
+
+
+def test_failed_run_can_be_reclaimed(db_session):
+    """
+    SECURITY (P1): a transient failure must not permanently swallow the UNIQUE
+    processing-key claim. A TERMINAL 'failed' claim is released (retry re-claims
+    and processes the document), while the failed attempt stays as audit history
+    with its claim field cleared. Active/completed/blocked claims still block.
+    """
+    import uuid
+
+    from aml_pipeline import _claim_processing_key, compute_processing_key
+    from models import PipelineRun
+
+    doc_bytes = b"%PDF-1.4 transient failure then retry"
+    pkey = compute_processing_key(VALID_ABN, hashlib.sha256(doc_bytes).hexdigest())
+
+    first, skip = _claim_processing_key(
+        db_session, str(uuid.uuid4()), pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert first is not None and skip is None
+
+    # The worker crashes / a transient failure marks the claim terminal-failed.
+    first.status = "failed"
+    first.completed_at = datetime.now(timezone.utc)
+    db_session.commit()
+
+    # A retry of the same document must be re-claimable and processable.
+    retry_run, skip_retry = _claim_processing_key(
+        db_session, str(uuid.uuid4()), pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert retry_run is not None
+    assert skip_retry is None
+    assert retry_run.status == "running"
+    assert retry_run.id != first.id
+
+    # The failed attempt is preserved (claim released); the retry owns the key.
+    failed_row = db_session.get(PipelineRun, first.id)
+    assert failed_row is not None
+    assert failed_row.status == "failed"
+    assert failed_row.processing_key is None
+    assert retry_run.processing_key == pkey
+    assert db_session.query(PipelineRun).count() == 2
+
+    # While the retry is active, concurrency enforcement still blocks dupes.
+    _, skip_dup = _claim_processing_key(
+        db_session, str(uuid.uuid4()), pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert skip_dup is not None
+    assert "in progress" in skip_dup
+
+
+def test_dfat_unavailable_produces_blocked_outcome(mock_s3, db_session):
+    """
+    SECURITY (P1): an unavailable DFAT list is an INCOMPLETE screen, consistent
+    with an unavailable PEP source — never a silently 'clean' result and never a
+    bare run failure. It resolves to a blocked/manual-review outcome, and the
+    run + trust are scoped by tenant.
+    """
+    from aml_pipeline import run_pipeline, PEPApiError, BLOCKED_PREFIX
+    from models import PipelineRun, Trust, Tenant
+
+    doc_bytes = b"%PDF-1.4 deed while DFAT is down"
+    s3_key = "client_uploads/dfat_down.pdf"
+
+    acme = Tenant(name="acme-corp")
+    db_session.add(acme)
+    db_session.flush()
+
+    with patch.dict(
+        os.environ,
+        {
+            "LLAMACLOUD_API_KEY": "fake",
+            "GOOGLE_API_KEY": "fake",
+            "ANTHROPIC_API_KEY": "fake",
+        },
+        clear=False,
+    ):
+        mock_s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=doc_bytes)
+        with patch("aml_pipeline.s3", mock_s3):
+            with patch("aml_pipeline.extract_trust_deed", side_effect=_generic_extract):
+                with patch(
+                    "aml_pipeline.load_dfat_sanctions",
+                    side_effect=PEPApiError("DFAT source unavailable"),
+                ):
+                    with patch("aml_pipeline.generate_audit_report") as mock_report:
+                        memo = run_pipeline(
+                            VALID_ABN,
+                            pre_uploaded_s3_key=s3_key,
+                            db=db_session,
+                            tenant_id=acme.id,
+                            tenant_name=acme.name,
+                        )
+
+    assert memo.startswith(BLOCKED_PREFIX)
+    # The safety memo must not depend on LLM availability.
+    mock_report.assert_not_called()
+    # DFAT failure marks the run BLOCKED, not failed.
+    run = db_session.query(PipelineRun).one()
+    assert run.status == "blocked"
+    # And the persisted trust record is owned by the tenant.
+    trust = db_session.query(Trust).one()
+    assert trust.tenant_id == acme.id
+    assert trust.run_id == run.run_id

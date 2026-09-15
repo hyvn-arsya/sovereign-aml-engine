@@ -208,3 +208,41 @@ def test_async_worker_marks_blocked_and_completed(client):
     body = resp.json()
     assert body["status"] == "blocked"
     assert body["compliance_memo"].startswith(BLOCKED_PREFIX)
+
+
+def test_sync_endpoint_scopes_pipeline_by_tenant(client):
+    """SECURITY (P0): the pipeline is invoked with the caller's tenant identity
+    so its processing key and persisted trust record are tenant-scoped."""
+    with patch("api.run_pipeline", return_value="memo") as mock_pipeline:
+        r = client.post(
+            "/analyze/abn",
+            json={"company_abn": VALID_ABN},
+            headers=_headers(ACME_KEY),
+        )
+    assert r.status_code == 200
+    assert mock_pipeline.call_args is not None
+    _, kwargs = mock_pipeline.call_args
+    assert kwargs["tenant_name"] == "acme-corp"
+    assert isinstance(kwargs["tenant_id"], int)
+
+
+def test_production_runtime_requires_real_salt():
+    """SECURITY (P2): outside development the API refuses to start with a
+    missing or unchanged (checked-in dev default) API_KEY_SALT."""
+    from api import _validate_production_config, _DEV_API_KEY_SALT
+
+    with pytest.raises(RuntimeError):
+        _validate_production_config({"SCREENING_MODE": "production"})
+    with pytest.raises(RuntimeError):
+        _validate_production_config({
+            "SCREENING_MODE": "production",
+            "API_KEY_SALT": _DEV_API_KEY_SALT,
+        })
+    # A real salt in production is accepted.
+    _validate_production_config({
+        "SCREENING_MODE": "production",
+        "API_KEY_SALT": "a-real-random-salt",
+    })
+    # Development defaults remain ergonomic (no salt required).
+    _validate_production_config({"ENV": "development"})
+    _validate_production_config({"ENV": "dev", "SCREENING_MODE": "demo"})

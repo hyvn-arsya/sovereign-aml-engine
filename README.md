@@ -249,8 +249,9 @@ Two infrastructure options are included:
 Python AWS CDK app that provisions a complete, production-hardened stack:
 
 - **S3** — raw-document bucket (S3-managed encryption) + append-only audit bucket: **versioned**, **S3-managed encryption**, and **Object Lock with a 7-year compliance-mode retention** (audit objects cannot be deleted or shortened, only released once the lock expires — AUSTRAC Part 11)
-- **LLM credentials** — a Secrets Manager secret (`LlmCredentials`) injected into the ECS task for `LLAMACLOUD_API_KEY` / `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY`; the operator fills its placeholder value before deploy (never baked into the image or task definition)
-- **Network path** — an explicit security-group rule (`allow_default_port_from`) lets the Fargate task reach PostgreSQL on the RDS default port, so the API and screening worker can actually hit the database
+- **Secrets from the operator, never generated** — LLM + app credentials come from **pre-existing Secrets Manager secrets** you reference by ARN. In production the stack **refuses to synthesize** without `-c llm_credentials_arn` and `-c app_secrets_arn`; the old generated `LlmCredentials` placeholder secret is gone. App config lives in one JSON secret (`API_KEY_SALT`, `SEED_API_KEYS`, `DFAT_SOURCE_URL`, `PEP_API_KEY`) injected as task secrets; `SCREENING_MODE` is pinned to `production` (prod) / `demo` (dev). To generate one: `aws secretsmanager create-secret --name app-config --secret-string '{"API_KEY_SALT":"...","SEED_API_KEYS":"tenant:key","DFAT_SOURCE_URL":"https://...","PEP_API_KEY":"..."}'`
+- **Migrations as a one-off run-task** — the serving container only runs `uvicorn api:app`; schema upgrades are a separate Fargate task (`alembic upgrade head`) sharing the image, DB secret, and a dedicated security group + log group (see step 4 below)
+- **Network path** — explicit security-group rules let the Fargate service **and** the migration run-task reach PostgreSQL on the RDS default port, so the API/screening worker and migrations can actually hit the database
 - **VPC** with CloudWatch flow logs
 - **RDS PostgreSQL** — encrypted, 7-day backup retention
 - **ECS Fargate** behind an **Application Load Balancer** with health checks on `/health`
@@ -262,8 +263,31 @@ Python AWS CDK app that provisions a complete, production-hardened stack:
 cd infrastructure
 python -m venv .venv && .venv\Scripts\activate
 pip install -r requirements.txt -r requirements-dev.txt
-cdk synth                              # '-c env=prod' for prod profile
+cdk synth                              # dev default; see below for prod
 cdk deploy SovereignAml-dev            # or SovereignAml-prod
+```
+
+**Production** requires the pre-created secrets (creation fails closed if the ARNs are missing):
+
+```bash
+cdk synth -c env=prod \
+  -c llm_credentials_arn=arn:aws:secretsmanager:...:secret:llm-creds-XXXXXX \
+  -c app_secrets_arn=arn:aws:secretsmanager:...:secret:app-config-XXXXXX
+cdk deploy SovereignAml-prod
+```
+
+(Alternatively set `LLM_CREDENTIALS_ARN` / `APP_SECRETS_ARN` environment variables instead of `-c` flags.)
+
+**Applying the schema migration** to a fresh environment (the deploy does NOT run it):
+
+```bash
+# Cluster + service names are printed as CDK outputs; default family is the
+# "MigrationTaskDefinitionFamily" output, DB port comes from the DatabaseEndpoint.
+aws ecs run-task --cluster <cluster> --launch-type FARGATE \
+  --task-definition <MigrationTaskDefinitionFamily> \
+  --network-configuration "awsvpcConfiguration={subnets=$(aws ec2 describe-subnets --filters Name=tag:aws-cdk:subnet-type,Values=Private --query 'Subnets[].SubnetId' --output text | tr '\t' ','),securityGroups=<MigrationTaskSecurityGroupId>,assignPublicIp=DISABLED}" \
+  --platform-version 1.4
+aws logs tail /aws/ecs/migrate --follow   # watch `alembic upgrade head` output
 ```
 
 ### Raw CloudFormation (`sovereign-aml.yaml`)
@@ -286,10 +310,11 @@ A standalone template (VPC, RDS, ECS Fargate, S3) provided as a reference altern
 
 ## Security & Compliance Notes
 
-- **Tenant-scoped API keys.** Every data endpoint requires `X-Api-Key`; keys map to a tenant, are stored only as salted SHA-256 hashes, and scope both S3 upload prefixes and job polling to that tenant. Cross-tenant access returns 401/403/404. Only `/health` is public (ALB probe).
-- **Fail-closed screening sources.** `SCREENING_MODE=production` refuses to screen unless real DFAT + PEP data sources are configured; no silent fallback to demo seeds.
-- **Blocked outcome, not a false success.** When extraction cannot complete (missing/mangled document) or a screening source is unavailable, the run is marked `blocked` with `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED` — the pipeline reports incomplete screening instead of laundering it into a "clean" memo.
-- **Idempotent claims are concurrency-safe.** Processing keys are unique at the DB level; concurrent duplicate submissions resolve to a single run (one INSERT wins, the rest are skipped) instead of racing to both process.
+- **Tenant-scoped API keys and pipeline data.** Every data endpoint requires `X-Api-Key`; keys map to a tenant, are stored only as salted SHA-256 hashes, and scope S3 upload prefixes and job polling to that tenant. The isolation stops at the API: **processing keys include the tenant name** (byte-identical deeds never collide across tenants) and the persisted audit trail (`trusts.tenant_id`) is tenant-owned. Cross-tenant access returns 401/403/404. Only `/health` is public (ALB probe).
+- **No placeholder secrets in prod.** Outside development the API refuses to start when `API_KEY_SALT` is missing or still the checked-in dev default, and the CDK prod stack refuses to synthesize without operator-provided Secrets Manager ARNs. There is no generated/placeholder credential path in production.
+- **Fail-closed screening sources.** `SCREENING_MODE=production` refuses to screen unless real DFAT + PEP data sources are configured; no silent fallback to demo seeds. In production the ECS task env pins `SCREENING_MODE=production`.
+- **Blocked outcome, not a false success.** When extraction cannot complete (missing/mangled document) **or a screening source is unavailable (DFAT or PEP down)** the run is marked `blocked` with `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED` — the pipeline reports incomplete screening instead of laundering it into a "clean" memo or an unhandled failure.
+- **Idempotent claims are concurrency-safe, failures are retryable.** Processing keys are unique at the DB level; concurrent duplicate submissions resolve to a single run (one INSERT wins, the rest are skipped) instead of racing to both process. A claim stuck on a `failed` run is released so the document can be retried, while the failed attempt stays as audit history.
 - `validate_env()` enforces required secrets before the pipeline runs.
 - All S3 writes use **server-side KMS encryption** (`aws:kms`), and the CDK audit bucket adds S3-managed encryption + **Object Lock 7-year compliance retention**.
 - Audit trail and memo persisted to S3 with **7-year retention** for AUSTRAC record-keeping.

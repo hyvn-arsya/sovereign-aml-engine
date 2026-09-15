@@ -8,6 +8,9 @@ class Trust(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String, unique=True, index=True, nullable=True)  # Nullable for legacy rows
+    # SECURITY REVIEW (tenant isolation): persisted trust records are owned by a
+    # tenant. NULL for local/legacy runs without API-key identity.
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
     processing_key = Column(String, unique=True, index=True, nullable=True)  # Deterministic idempotency key
     reference_number = Column(String, unique=True, index=True)
     abn = Column(String, index=True, nullable=False)

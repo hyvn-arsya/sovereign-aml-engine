@@ -174,6 +174,7 @@ def compute_processing_key(
     pipeline_version: str = PIPELINE_VERSION,
     extraction_model: str = EXTRACTION_MODEL,
     screening_algorithm_version: str = SCREENING_ALGORITHM_VERSION,
+    tenant_id: Optional[str] = None,
 ) -> str:
     """
     Deterministic identity of ONE processing request.
@@ -183,20 +184,26 @@ def compute_processing_key(
     any component — a new document, a different ABN, a model upgrade — yields a
     NEW key and a legitimate re-process.
 
+    SECURITY REVIEW (tenant isolation): when ``tenant_id`` (the tenant's stable
+    name/slug) is supplied it becomes part of the key, so byte-identical deeds
+    submitted by DIFFERENT tenants resolve to DIFFERENT processing keys. No
+    tenant's run can be skipped, or its result/reference adopted, because
+    another tenant screened the same bytes.
+
     This is idempotency, NOT exactly-once: a worker can still crash after an
     external side effect (e.g. the memo pushed to a downstream channel) and
     before recording completion. The audit trail + pipeline_runs row make that
     traceable.
     """
-    raw = "|".join(
-        [
-            document_sha256_hex,
-            company_abn,
-            pipeline_version,
-            extraction_model,
-            screening_algorithm_version,
-        ]
-    )
+    components = [
+        tenant_id or "",
+        document_sha256_hex,
+        company_abn,
+        pipeline_version,
+        extraction_model,
+        screening_algorithm_version,
+    ]
+    raw = "|".join(components)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 # ─────────────────────────────────────────────
@@ -1112,6 +1119,8 @@ def run_pipeline(
     max_retries: int = 2,
     db: Optional[Session] = None,
     run_id: Optional[str] = None,
+    tenant_id: Optional[int] = None,
+    tenant_name: Optional[str] = None,
 ) -> str:
     """
     Runs the full AML/KYC screening pipeline for a given ABN.
@@ -1121,6 +1130,9 @@ def run_pipeline(
         pre_uploaded_s3_key: S3 key of a client-uploaded trust deed (Path A).
                              If None, Agent 1 attempts to fetch from the registry.
         max_retries:         How many times to retry Agent 2 on transient failures.
+        tenant_id:           FK of the owning tenant (persisted on the Trust row).
+        tenant_name:         Tenant slug; scopes the processing key so two tenants
+                             screening byte-identical deeds never collide.
 
     Returns:
         The final compliance memo as a string.
@@ -1172,7 +1184,10 @@ def run_pipeline(
     processing_key = None
     try:
         document_hash = _document_sha256(s3_key)
-        processing_key = compute_processing_key(company_abn, document_hash)
+        # SECURITY REVIEW: the processing key is scoped by tenant identity, so
+        # byte-identical deeds from different tenants never share an idempotency
+        # key (no cross-tenant SKIP, no cross-tenant reference adoption).
+        processing_key = compute_processing_key(company_abn, document_hash, tenant_id=tenant_name)
         log.debug(f"Pipeline: processing_key={processing_key}")
     except (BotoCoreError, ClientError) as exc:
         # If the document cannot be read we cannot fingerprint it. The pipeline
@@ -1267,9 +1282,28 @@ def run_pipeline(
         raise
 
     # ── AGENT 3: Screen ───────────────────────────────────────────────────────
+    dfat_unavailable_reason: Optional[str] = None
     try:
         dfat_db = load_dfat_sanctions()
         audit_trail = check_austrac_policy(extracted_json, dfat_db)
+    except PEPApiError as exc:
+        # SECURITY REVIEW (P1): an unavailable DFAT sanctions list is an
+        # INCOMPLETE screen, not a hard run failure — exactly like an
+        # unavailable PEP source (handled inside check_austrac_policy). Mark the
+        # run blocked / manual-review so no "clean" result is emitted without
+        # the consolidated sanctions check having actually run.
+        log.error(f"Pipeline: DFAT sanctions source unavailable — {exc}")
+        dfat_unavailable_reason = str(exc)
+        audit_trail = {
+            "trust_name": None,
+            "trustee_company": None,
+            "is_high_risk_flag": False,
+            "total_entities_checked": 0,
+            "screening_sources": [],
+            "red_flags": [],
+            "screening_incomplete": True,
+            "dfat_unavailable_reason": dfat_unavailable_reason,
+        }
     except Exception:
         if pipeline_run is not None and db is not None:
             _mark_pipeline_run_failed(db, pipeline_run, pipeline_started)
@@ -1292,10 +1326,15 @@ def run_pipeline(
     #   * extraction chunk dropped -> extraction_stats["failed_chunks"] > 0 (Agent 2)
     incomplete_reasons: list[str] = []
     failed_chunks = extraction_stats.get("failed_chunks", 0)
-    if audit_trail.get("screening_incomplete", False):
+    if audit_trail.get("screening_incomplete", False) and not dfat_unavailable_reason:
         incomplete_reasons.append(
             "PEP (Politically Exposed Persons) screening source was unavailable "
             "(PEP API failed or unconfigured)"
+        )
+    if dfat_unavailable_reason:
+        incomplete_reasons.append(
+            "DFAT consolidated sanctions list was unavailable "
+            f"({dfat_unavailable_reason})"
         )
     if failed_chunks > 0:
         incomplete_reasons.append(
@@ -1387,6 +1426,7 @@ def run_pipeline(
             # 1. Create the parent Trust record
             trust_record = Trust(
                 run_id=run_id,
+                tenant_id=tenant_id,
                 processing_key=processing_key,
                 reference_number=reference_number,
                 abn=company_abn,
@@ -1514,6 +1554,17 @@ def _claim_processing_key(
     return a skip message. Official replay (Trust row already exists) is also
     detected here to make the skip message accurate.
 
+    SECURITY REVIEW (P1 - retry after failure): a transient failure leaves the
+    failed run's PipelineRun row permanently holding the UNIQUE processing key,
+    so a retry of the same document previously bounced with "already in
+    progress". A TERMINAL 'failed' claim is now released and re-claimed: the
+    failed row's processing_key is cleared (keeping the failed attempt as audit
+    history) and a fresh attempt row is inserted. Only 'failed' claims are
+    eligible — active ('running') and completed/'blocked' outcomes still block
+    or report an official replay reference. The re-claim is concurrency-safe:
+    the failed->released transition is guarded by rowcount, so exactly one
+    retry wins.
+
     Returns ``(pipeline_run, None)`` on success, or ``(None, skip_message)`` if
     the key was already claimed/processed. Never returns both.
     """
@@ -1539,6 +1590,39 @@ def _claim_processing_key(
             existing_trust = db.query(Trust).filter(Trust.processing_key == processing_key).first()
             if existing_trust is not None:
                 return None, f"SKIPPED: Already processed under reference {existing_trust.reference_number}"
+            existing_run = (
+                db.query(PipelineRun)
+                .filter(PipelineRun.processing_key == processing_key)
+                .first()
+            )
+            if existing_run is not None and existing_run.status == "failed":
+                # Release the dead claim so a retry can proceed. Guarded by
+                # rowcount: if another worker re-claimed in the meantime we lose
+                # the race and fall through to the skip message.
+                released = (
+                    db.query(PipelineRun)
+                    .filter(
+                        PipelineRun.processing_key == processing_key,
+                        PipelineRun.status == "failed",
+                    )
+                    .update({"processing_key": None}, synchronize_session=False)
+                )
+                db.commit()
+                if released:
+                    retry_run = PipelineRun(
+                        run_id=run_id,
+                        processing_key=processing_key,
+                        abn=abn,
+                        status="running",
+                        started_at=started_at,
+                    )
+                    db.add(retry_run)
+                    db.commit()
+                    log.info(
+                        f"Pipeline: re-claimed processing_key {processing_key[:12]}… "
+                        f"after a failed attempt (retry)"
+                    )
+                    return retry_run, None
         return (
             None,
             "SKIPPED: Processing already in progress for this document "
