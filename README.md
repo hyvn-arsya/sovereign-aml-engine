@@ -113,12 +113,15 @@ sovereign-aml-engine
 ├── api.py                    # FastAPI app (sync + async job endpoints)
 ├── aml_pipeline.py           # 4-agent pipeline orchestrator
 ├── llm_provider.py           # LLMProvider seam (cloud default + local Ollama)
-├── models.py                 # SQLAlchemy ORM models (Trust/PipelineRun/Entity/etc.)
+├── models.py                 # SQLAlchemy ORM models (Tenant/ApiKey/Trust/PipelineRun/Entity/etc.)
 ├── database.py               # DB engine/session (SQLite local, Postgres/RDS)
 ├── init_db.py                # Create database tables
 ├── test_aml_pipeline.py      # Unit tests for screening logic
+├── test_api_auth.py          # API security tests (auth, tenant isolation, blocked status)
 ├── test_priorities.py        # Idempotency + pipeline_runs + entity model (moto + in-memory SQLite)
 ├── test_moto_s3.py           # Moto-backed S3 integration tests (no AWS required)
+├── pytest.ini                # pytest config (excludes infrastructure/ from root suite)
+├── alembic/                  # Database migrations (alembic init, env.py, versions/)
 ├── Dockerfile                # Containerized FastAPI (uvicorn, port 8000)
 ├── docker-compose.yml        # App + PostgreSQL, one-command demo
 ├── sovereign-aml.yaml        # Raw CloudFormation IaC reference
@@ -156,13 +159,35 @@ Without a `DB_HOST`, the app falls back to a local SQLite file — no database s
 
 **LLM provider** (optional): the pipeline calls Gemini (extraction) and Claude (reporting) by default through the `LLMProvider` seam. To run extraction/reporting on a **self-hosted model** instead, set `LLM_PROVIDER=ollama` (plus `OLLAMA_BASE_URL` / `OLLAMA_MODEL`). If you use Ollama, you **must** size the model's context window to fit the pipeline's chunk size — set `OLLAMA_CONTEXT_LENGTH` on the server or bake `PARAMETER num_ctx <size>` into a custom Modelfile — otherwise over-length chunks are silently truncated (see `llm_provider.py`). The provider refuses to start with `OLLAMA_REQUIRE_CONTEXT=true` if the active context is too small.
 
+**Screening data source mode** (fail-closed): `SCREENING_MODE=demo` (default) uses bundled **mock** DFAT/PEP seed data for development. Setting `SCREENING_MODE=production` makes screening **refuse to run** unless real data sources are configured — `DFAT_SOURCE_URL` pointing at the DFAT consolidated list download, and `PEP_API_KEY` for the PEP provider — raising an error instead of silently screening against demo data. In `demo` mode the mock sources are loud about being non-production.
+
 ### 3. Initialize the database
+
+The schema is versioned with **Alembic**. With a real database configured (`DB_HOST`):
+
+```bash
+alembic upgrade head
+```
+
+For a plain-SQLite quickstart (no `DB_HOST`), `init_db.py` remains:
 
 ```bash
 python init_db.py
 ```
 
-### 4. Run the API
+### 4. Configure API keys (authentication)
+
+Every `/analyze/*` and `/jobs/*` call requires an **`X-Api-Key`** header — there is no anonymous access (only `/health` stays open for the ALB probe). API keys are tenant-scoped: the key maps to a tenant (e.g. `acme-corp`), and the tenant's name is the required prefix for any uploaded S3 document key and the boundary for job polling.
+
+Keys are stored **only as a salted SHA-256 hash** (`API_KEY_SALT` + key). Issue keys via the `SEED_API_KEYS` env var, which the app loads once at startup:
+
+```bash
+SEED_API_KEYS="acme-corp:key-for-acme,big-bank:key-for-big-bank"
+```
+
+Rotation = issue a new key, then deactivate the old one. Never change `API_KEY_SALT` after keys are issued — it re-hashes would invalidate every stored key.
+
+### 5. Run the API
 
 ```bash
 uvicorn api:app --reload
@@ -170,28 +195,32 @@ uvicorn api:app --reload
 
 **Endpoints** (OpenAPI docs at `http://localhost:8000/docs`):
 
-| Method | Path                  | Description                                                     |
-|--------|-----------------------|-----------------------------------------------------------------|
-| GET    | `/health`             | Liveness probe used by the ALB health check                    |
-| POST   | `/analyze/abn`        | Run the full 4-agent pipeline, block for the compliance memo   |
-| POST   | `/analyze/abn/async`  | Queue the pipeline (202 + `job_id`), return immediately        |
-| GET    | `/jobs/{job_id}`      | Poll an async job's status and result                          |
+| Method | Path                  | Auth    | Description                                                     |
+|--------|-----------------------|---------|-----------------------------------------------------------------|
+| GET    | `/health`             | public  | Liveness probe used by the ALB health check                    |
+| POST   | `/analyze/abn`        | API key | Run the full 4-agent pipeline, block for the compliance memo   |
+| POST   | `/analyze/abn/async`  | API key | Queue the pipeline (202 + `job_id`), return immediately        |
+| GET    | `/jobs/{job_id}`      | API key | Poll an async job's status and result (scoped to your tenant)  |
 
 ```bash
 curl -X POST http://localhost:8000/analyze/abn \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{"company_abn": "51824753556"}'
 
 # Async (returns immediately, then poll the job):
 JOB=$(curl -s -X POST http://localhost:8000/analyze/abn/async \
-  -H "Content-Type: application/json" -d '{"company_abn":"51824753556"}' \
+  -H "Content-Type: application/json" -H "X-Api-Key: $API_KEY" \
+  -d '{"company_abn":"51824753556"}' \
   | python -c "import sys,json;print(json.load(sys.stdin)['job_id'])")
-curl -s http://localhost:8000/jobs/$JOB
+curl -s -H "X-Api-Key: $API_KEY" http://localhost:8000/jobs/$JOB
 ```
+
+> **Job statuses:** `queued` → `running` → `completed` or `failed`. If screening could not complete because the document is too damaged to extract fully (missing PDF, chunk-extraction failures) **or** the PEP source was unavailable in `production` mode, the job lands in **`blocked`** — the memo is marked `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED` and a human reviewer must complete the screening manually. Deterministic screening never silently reports success it does not have.
 
 > The synchronous endpoint keeps the connection open for the 20–40s pipeline runtime. For production, use the async endpoint — the background worker is factored to run behind an SQS/Fargate consumer.
 
-### 5. Run the tests
+### 6. Run the tests
 
 ```bash
 pip install -r requirements-dev.txt
@@ -219,7 +248,9 @@ Two infrastructure options are included:
 
 Python AWS CDK app that provisions a complete, production-hardened stack:
 
-- **S3** — raw-document bucket + append-only audit bucket (versioned)
+- **S3** — raw-document bucket (S3-managed encryption) + append-only audit bucket: **versioned**, **S3-managed encryption**, and **Object Lock with a 7-year compliance-mode retention** (audit objects cannot be deleted or shortened, only released once the lock expires — AUSTRAC Part 11)
+- **LLM credentials** — a Secrets Manager secret (`LlmCredentials`) injected into the ECS task for `LLAMACLOUD_API_KEY` / `GOOGLE_API_KEY` / `ANTHROPIC_API_KEY`; the operator fills its placeholder value before deploy (never baked into the image or task definition)
+- **Network path** — an explicit security-group rule (`allow_default_port_from`) lets the Fargate task reach PostgreSQL on the RDS default port, so the API and screening worker can actually hit the database
 - **VPC** with CloudWatch flow logs
 - **RDS PostgreSQL** — encrypted, 7-day backup retention
 - **ECS Fargate** behind an **Application Load Balancer** with health checks on `/health`
@@ -255,8 +286,12 @@ A standalone template (VPC, RDS, ECS Fargate, S3) provided as a reference altern
 
 ## Security & Compliance Notes
 
+- **Tenant-scoped API keys.** Every data endpoint requires `X-Api-Key`; keys map to a tenant, are stored only as salted SHA-256 hashes, and scope both S3 upload prefixes and job polling to that tenant. Cross-tenant access returns 401/403/404. Only `/health` is public (ALB probe).
+- **Fail-closed screening sources.** `SCREENING_MODE=production` refuses to screen unless real DFAT + PEP data sources are configured; no silent fallback to demo seeds.
+- **Blocked outcome, not a false success.** When extraction cannot complete (missing/mangled document) or a screening source is unavailable, the run is marked `blocked` with `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED` — the pipeline reports incomplete screening instead of laundering it into a "clean" memo.
+- **Idempotent claims are concurrency-safe.** Processing keys are unique at the DB level; concurrent duplicate submissions resolve to a single run (one INSERT wins, the rest are skipped) instead of racing to both process.
 - `validate_env()` enforces required secrets before the pipeline runs.
-- All S3 writes use **server-side KMS encryption** (`aws:kms`).
+- All S3 writes use **server-side KMS encryption** (`aws:kms`), and the CDK audit bucket adds S3-managed encryption + **Object Lock 7-year compliance retention**.
 - Audit trail and memo persisted to S3 with **7-year retention** for AUSTRAC record-keeping.
 - Deterministic **reference number** for each run.
 - PII redacted (`redact()`) in logs; structured JSON logging.

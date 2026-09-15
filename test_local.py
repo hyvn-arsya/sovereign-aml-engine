@@ -29,6 +29,8 @@ import os
 import sys
 import logging
 
+import pytest
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -93,6 +95,13 @@ def test_agents_3_and_4_mock():
     return audit_trail
 
 
+@pytest.mark.skip(
+    reason=(
+        "Manual dev script: needs a real PDF file plus live "
+        "GOOGLE_API_KEY/ANTHROPIC_API_KEY. Run directly via "
+        "`python test_local.py C:\\path\\to\\trust_deed.pdf`."
+    )
+)
 def test_full_pipeline_local(pdf_path: str):
     """Test Agents 2->3->4 with a real PDF file from disk."""
     import pymupdf4llm

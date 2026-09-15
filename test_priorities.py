@@ -19,6 +19,7 @@ Run with:
 import hashlib
 import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import patch
 
 import boto3
@@ -357,3 +358,239 @@ def test_direct_match_recorded_as_direct_method(mock_s3, db_session):
     assert len(matches) == 1
     assert matches[0].match_method == "direct"
     assert matches[0].watchlist_name == "Jonathan Smith"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# SECURITY REVIEW REGRESSIONS
+#  * incomplete screening → explicit BLOCKED outcome (not a normal memo)
+#  * blocked memo is deterministic (LLM-independent)
+#  * concurrency-safe claim on the processing key
+#  * production screening mode fails closed on mock DFAT / PEP sources
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _generic_extract(s3_key_arg, stats=None):
+    stats["chunk_count"] = 2
+    return _extraction_json()
+
+
+def test_incomplete_pep_screening_returns_blocked_outcome(mock_s3, db_session):
+    """
+    SECURITY (High): a failed PEP lookup must yield an explicit blocked outcome
+    with pipeline_runs.status='blocked' — never a normal compliance memo.
+    """
+    from aml_pipeline import run_pipeline, PEPApiError, BLOCKED_PREFIX
+
+    doc_bytes = b"%PDF-1.4 deed when the PEP API is down"
+    s3_key = "client_uploads/pep_down.pdf"
+
+    with patch.dict(
+        os.environ,
+        {
+            "LLAMACLOUD_API_KEY": "fake",
+            "GOOGLE_API_KEY": "fake",
+            "ANTHROPIC_API_KEY": "fake",
+        },
+        clear=False,
+    ):
+        mock_s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=doc_bytes)
+        with patch("aml_pipeline.s3", mock_s3):
+            with patch("aml_pipeline.extract_trust_deed", side_effect=_generic_extract):
+                with patch("aml_pipeline.load_pep_list", side_effect=PEPApiError("PEP down")):
+                    with patch("aml_pipeline.generate_audit_report") as mock_report:
+                        memo = run_pipeline(
+                            VALID_ABN, pre_uploaded_s3_key=s3_key, db=db_session
+                        )
+
+    assert memo.startswith(BLOCKED_PREFIX)
+    # The safety memo must not depend on LLM availability.
+    mock_report.assert_not_called()
+
+    from models import PipelineRun
+
+    run = db_session.query(PipelineRun).one()
+    assert run.status == "blocked"
+    assert run.completed_at is not None
+
+
+def test_extraction_chunk_failure_blocks_outcome(mock_s3, db_session):
+    """
+    SECURITY (High): a dropped extraction chunk is a data-availability gap and
+    must block, not silently produce a normal memo.
+    """
+    from aml_pipeline import run_pipeline, BLOCKED_PREFIX
+
+    doc_bytes = b"%PDF-1.4 deed with a chunk that will fail"
+    s3_key = "client_uploads/chunk_fail.pdf"
+
+    def flaky_extract(s3_key_arg, stats=None):
+        stats["chunk_count"] = 3
+        stats["failed_chunks"] = 1
+        stats["failed_chunk_indexes"] = [2]
+        return _extraction_json()
+
+    with patch.dict(
+        os.environ,
+        {
+            "LLAMACLOUD_API_KEY": "fake",
+            "GOOGLE_API_KEY": "fake",
+            "ANTHROPIC_API_KEY": "fake",
+        },
+        clear=False,
+    ):
+        mock_s3.put_object(Bucket=S3_BUCKET, Key=s3_key, Body=doc_bytes)
+        with patch("aml_pipeline.s3", mock_s3):
+            with patch("aml_pipeline.extract_trust_deed", side_effect=flaky_extract):
+                with patch("aml_pipeline.load_pep_list", return_value=[]):
+                    with patch("aml_pipeline.generate_audit_report") as mock_report:
+                        memo = run_pipeline(
+                            VALID_ABN, pre_uploaded_s3_key=s3_key, db=db_session
+                        )
+
+    assert memo.startswith(BLOCKED_PREFIX)
+    assert "chunk" in memo
+    mock_report.assert_not_called()
+
+    from models import PipelineRun
+
+    run = db_session.query(PipelineRun).one()
+    assert run.status == "blocked"
+
+
+def test_extraction_stats_record_failed_chunks():
+    """
+    SECURITY (High): a chunk that fails to extract is surfaced in stats
+    (failed_chunks / failed_chunk_indexes) instead of being silently dropped.
+    """
+    import io
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    from aml_pipeline import extract_trust_deed, TrustDeedExtraction
+
+    doc_bytes = b"%PDF-1.4 a deed with two llm chunks"
+
+    class FakeLlamaParse:
+        def __init__(self, **kwargs):
+            pass
+
+        def load_data(self, file_path, extra_info):
+            return [
+                SimpleNamespace(text="A" * 30000),
+                SimpleNamespace(text="B" * 30000),
+            ]
+
+    provider = Mock()
+    provider.name = "fake-provider"
+    provider.extract_structured.side_effect = [
+        RuntimeError("LLM down for chunk 1"),
+        TrustDeedExtraction(
+            trust_name="Test Trust",
+            trustee_company="Test Trustee Pty Ltd",
+            beneficiaries=["Beneficiary One"],
+            is_high_risk=False,
+        ),
+    ]
+
+    stats = {}
+    with patch.dict(os.environ, {"LLAMACLOUD_API_KEY": "fake"}, clear=False):
+        with patch("aml_pipeline.LlamaParse", FakeLlamaParse):
+            with patch("aml_pipeline._provider", return_value=provider):
+                with patch(
+                    "aml_pipeline.s3.get_object",
+                    return_value={"Body": io.BytesIO(doc_bytes)},
+                ):
+                    extract_trust_deed("client_uploads/failed_chunks.pdf", stats=stats)
+
+    assert stats["chunk_count"] == 2
+    assert stats["failed_chunks"] == 1
+    assert stats["failed_chunk_indexes"] == [1]
+
+
+def test_claim_processing_key_prevents_duplicate_work(db_session):
+    """
+    SECURITY (Medium): the unique processing_key on pipeline_runs is a
+    concurrency-safe claim. A second worker racing on the same key is skipped
+    instead of duplicating expensive Agent 2/3 work.
+    """
+    import uuid
+
+    from aml_pipeline import _claim_processing_key, compute_processing_key
+    from models import PipelineRun, Trust
+
+    doc_bytes = b"%PDF-1.4 concurrent deed"
+    pkey = compute_processing_key(VALID_ABN, hashlib.sha256(doc_bytes).hexdigest())
+
+    # Worker A claims the key.
+    run_a = str(uuid.uuid4())
+    claimed, skip = _claim_processing_key(
+        db_session, run_a, pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert claimed is not None
+    assert skip is None
+
+    # Worker B races with an identical claim while A is still running.
+    run_b = str(uuid.uuid4())
+    claimed_b, skip_b = _claim_processing_key(
+        db_session, run_b, pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert claimed_b is None
+    assert "in progress" in skip_b
+    assert "SKIPPED" in skip_b
+
+    # A now completes and records the Trust row.
+    db_session.add(Trust(
+        run_id=run_a,
+        processing_key=pkey,
+        reference_number=f"AML-{VALID_ABN}-{run_a[:8]}",
+        abn=VALID_ABN,
+    ))
+    db_session.commit()
+
+    # A retry after completion reports the official reference number.
+    _, skip_c = _claim_processing_key(
+        db_session, str(uuid.uuid4()), pkey, VALID_ABN, datetime.now(timezone.utc)
+    )
+    assert f"reference AML-{VALID_ABN}" in skip_c
+
+    # Only worker A's claim row survived; neither loser added a row.
+    assert db_session.query(PipelineRun).count() == 1
+    assert db_session.query(Trust).count() == 1
+
+
+def test_production_mode_refuses_mock_dfat():
+    """SECURITY (High): production mode fails closed without a real DFAT source."""
+    from aml_pipeline import load_dfat_sanctions, PEPApiError, _dfat_cache
+
+    _dfat_cache["data"] = None
+    _dfat_cache["fetched_at"] = None
+    with patch.dict(
+        os.environ,
+        {"SCREENING_MODE": "production", "DFAT_SOURCE_URL": ""},
+        clear=False,
+    ):
+        with pytest.raises(PEPApiError):
+            load_dfat_sanctions()
+    _dfat_cache["data"] = None
+    _dfat_cache["fetched_at"] = None
+
+
+def test_production_mode_refuses_mock_pep():
+    """SECURITY (High): production mode fails closed without a PEP provider."""
+    from aml_pipeline import load_pep_list, PEPApiError
+
+    with patch.dict(
+        os.environ,
+        {"SCREENING_MODE": "production", "PEP_API_KEY": ""},
+        clear=False,
+    ):
+        with pytest.raises(PEPApiError):
+            load_pep_list()
+
+
+def test_demo_mode_returns_mocks_by_default():
+    """Demo (default) mode still returns the bundled mock data with a warning."""
+    from aml_pipeline import load_pep_list
+
+    with patch.dict(os.environ, {"PEP_API_KEY": ""}, clear=False):
+        peps = load_pep_list()
+    assert any(p["type"].startswith("PEP") for p in peps)

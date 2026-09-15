@@ -2,3 +2,5 @@
 pytest>=8.0
 pymupdf4llm>=0.0.17
 moto[s3]>=5.0
+alembic>=1.14.0
+tzdata>=2026.4

@@ -1,5 +1,27 @@
 # Releases
 
+## v0.2.0-alpha
+
+**Security review — 7 findings triaged and fixed in one pass, with regression tests and CDK assertions.**
+
+### What shipped
+
+- **Tenant-scoped API keys** — every `/analyze/*` and `/jobs/*` endpoint requires `X-Api-Key`; keys are stored as salted SHA-256 hashes, seeded via `SEED_API_KEYS="tenant:key,..."`, and enforce tenant borders on S3 prefixes (403) and job polling (404). `/health` stays public for the ALB probe.
+- **Fail-closed screening sources** — `SCREENING_MODE=production` refuses to screen without `DFAT_SOURCE_URL` (real DFAT consolidated list) and `PEP_API_KEY`; no silent fallback to demo seeds. Demo mode remains, loudly.
+- **Blocked outcome** — incomplete extraction (missing doc, chunk failures) resolves to `status=blocked` with `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED`, propagated through sync and async API paths. Screening never reports success it doesn't have.
+- **Concurrency-safe idempotency** — `PipelineRun.processing_key` is UNIQUE; the claim is a `CREATE` whose `IntegrityError` resolves to a skip, so duplicate concurrent submissions converge on one run.
+- **IaC hardening** — Fargate→RDS security-group rule added; LLM provider keys moved to a Secrets Manager secret injected as ECS task secrets (operator fills placeholder before deploy); audit bucket now has S3-managed encryption + **Object Lock 7-year compliance retention**.
+- **Alembic migrations** — schema is versioned (`alembic upgrade head`); initial baseline migration verified against a fresh database.
+
+### Test suite (48 root + 8 CDK, all green)
+
+- 18 `test_priorities.py` (original data-engineering + 7 new security regressions: blocked outcomes, chunk-failure stats, concurrency claim, production fails closed, demo defaults)
+- 12 `test_api_auth.py` (auth 401s, cross-tenant S3 403, tenant-scoped polling 404, blocked/completed job status, plaintext-never-persisted)
+- 14 pipeline unit + 3 moto S3 (unchanged) + 1 local mock (now green with `tzdata` installed)
+- 8 CDK unit tests asserting the new Object Lock retention, encryption, LLM secret, and Fargate→RDS rule
+
+---
+
 ## v0.1.0-alpha
 
 **Core pipeline (4-agent extraction/screening/reporting) tested, live-verified, and passing.**

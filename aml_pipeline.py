@@ -44,6 +44,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from zoneinfo import ZoneInfo  # FIX #3: Timezone-aware datetime
 
 os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
@@ -108,6 +109,25 @@ EXTRACTION_MODEL = os.environ.get("EXTRACTION_MODEL", "gemini-3.1-pro-preview")
 # than an idempotent replay of an old result.
 PIPELINE_VERSION = os.environ.get("PIPELINE_VERSION", "0.1.0")
 SCREENING_ALGORITHM_VERSION = os.environ.get("SCREENING_ALGORITHM_VERSION", "1")
+
+# Screenshot sources: SECURITY REVIEW — the DFAT / PEP datasets shipped in this
+# repo are MOCK data. They are only legitimate in "demo" mode. In "production"
+# mode the pipeline fails closed unless real authoritative sources are
+# configured (DFAT_SOURCE_URL / PEP_API_KEY). This prevents a deployment from
+# silently representing mock data as real screening.
+SCREENING_MODE = os.environ.get("SCREENING_MODE", "demo")  # demo|production
+
+# Marker used by the API layer to detect a blocked/manual-review outcome. When
+# screening is incomplete the pipeline emits a deterministic blocked memo (safety
+# decisions must not depend on LLM availability) and the surrounding service maps
+# it to an explicit blocked status rather than a normal completed compliance memo.
+BLOCKED_PREFIX = "OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED"
+
+
+def _is_production_screening_mode() -> bool:
+    # Read the live env so the mode can be flipped at deployment/run time; the
+    # module default (SCREENING_MODE) is only the fallback.
+    return os.environ.get("SCREENING_MODE", SCREENING_MODE).strip().lower() == "production"
 
 # Candidate/placeholder role strings for a trustee that never extracted a
 # concrete trustee entity — used by the chunk-merge reconciliation in Agent 2.
@@ -503,6 +523,8 @@ def extract_trust_deed(s3_key: str, stats: Optional[dict] = None) -> str:
     chunks = _split_into_chunks(markdown_text)
     if stats is not None:
         stats["chunk_count"] = len(chunks)
+        stats["failed_chunks"] = 0
+        stats["failed_chunk_indexes"] = []
     log.info(f"Agent 2: Extracting entities across {len(chunks)} chunks using {_provider().name}...")
 
     all_beneficiaries = []
@@ -556,7 +578,13 @@ Document Text Chunk:
                 all_beneficiaries.extend(chunk_result.beneficiaries)
                 
         except Exception as e:
+            # SECURITY REVIEW: a chunk we could not extract is a data-availability
+            # gap — entities may exist in the deed that we never screened. It must
+            # surface as an INCOMPLETE outcome, not be silently ignored.
             log.warning(f"Agent 2: Failed to parse chunk {i+1} - {e}")
+            if stats is not None:
+                stats["failed_chunks"] = stats.get("failed_chunks", 0) + 1
+                stats["failed_chunk_indexes"] = stats.get("failed_chunk_indexes", []) + [i + 1]
 
     # Reconciliation Rule: Fuzzy Deduplication for beneficiaries
     unique_beneficiaries = []
@@ -703,6 +731,11 @@ def load_dfat_sanctions() -> list[dict]:
     Downloads and caches the DFAT Consolidated Sanctions List.
     In production: parse the official CSV/XML from DFAT.
     Cache is refreshed every 24 hours.
+
+    SECURITY REVIEW: by default this returns the bundled DEMO dataset and logs
+    that fact loudly. In SCREENING_MODE=production it fails closed unless a real
+    authoritative source (DFAT_SOURCE_URL) is configured — mock data must never
+    be presented as a real sanctions screen.
     """
     with _dfat_lock:
         now = time.time()
@@ -716,6 +749,47 @@ def load_dfat_sanctions() -> list[dict]:
 
         log.info("Agent 3: Refreshing DFAT sanctions list...")
 
+        source_url = os.environ.get("DFAT_SOURCE_URL")
+        if source_url:
+            try:
+                response = requests.get(source_url, timeout=15)
+                response.raise_for_status()
+                # Minimal real-source parser: accept a JSON array of {"name": ...}
+                # entries or a newline-separated "Name,Type" CSV. Replace with the
+                # official DFAT consolidated-list format when integrated.
+                text = response.text.strip()
+                if text.startswith("["):
+                    payload = json.loads(text)
+                    data = [
+                        {"name": row["name"], "type": row.get("type", "Sanctioned - DFAT Consolidated List")}
+                        for row in payload
+                    ]
+                else:
+                    data = []
+                    for line in text.splitlines()[1:]:
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 1 and parts[0]:
+                            data.append({
+                                "name": parts[0],
+                                "type": parts[1] if len(parts) > 1 else "Sanctioned - DFAT Consolidated List",
+                            })
+                _dfat_cache["data"] = data
+                _dfat_cache["fetched_at"] = now
+                log.info(f"Agent 3: Loaded {len(data)} entries from DFAT source {source_url}")
+                return data
+            except (requests.RequestException, json.JSONDecodeError, KeyError) as exc:
+                raise PEPApiError(f"DFAT source unavailable: {exc}") from exc
+
+        if _is_production_screening_mode():
+            raise PEPApiError(
+                "Production screening requires a real DFAT source "
+                "(set DFAT_SOURCE_URL). Refusing to use bundled mock sanctions data."
+            )
+
+        log.warning(
+            "Agent 3: Using MOCK DFAT sanctions data (SCREENING_MODE=demo). "
+            "This is NOT a real sanctions screen."
+        )
         data = [
             {"name": "Jonathan Smith", "type": "Sanctioned - DFAT Consolidated List"},
             {"name": "Vladimir Ivanov", "type": "Sanctioned - Foreign National"},
@@ -729,10 +803,22 @@ def load_dfat_sanctions() -> list[dict]:
 def load_pep_list() -> list[dict]:
     """
     FIX #6: PEP (Politically Exposed Persons) screening integration.
+
+    SECURITY REVIEW: the bundled PEP dataset is MOCK data for testing. In
+    SCREENING_MODE=production a missing PEP_API_KEY fails closed instead of
+    silently screening against fake people.
     """
     api_key = os.environ.get("PEP_API_KEY")
     if not api_key:
-        log.info("Agent 3: No PEP_API_KEY found. Using mock PEP database for testing.")
+        if _is_production_screening_mode():
+            raise PEPApiError(
+                "Production screening requires a PEP provider (set PEP_API_KEY). "
+                "Refusing to use bundled mock PEP data."
+            )
+        log.warning(
+            "Agent 3: No PEP_API_KEY found. Using MOCK PEP database for testing "
+            "(SCREENING_MODE=demo). This is NOT a real PEP screen."
+        )
         return [
             {"name": "Vladimir Ivanovich Petrov", "type": "PEP - Foreign Government Official"},
             {"name": "Sarah Louise Pemberton", "type": "PEP - Close Associate"}
@@ -951,6 +1037,57 @@ and a signature block for the Compliance Officer.
     return memo
 
 
+def _build_blocked_memo(audit_trail: dict, reasons: list[str]) -> str:
+    """
+    Deterministic fallback memo for an INCOMPLETE screening run.
+
+    SECURITY REVIEW: when any part of the screening could not be completed (PEP
+    source unavailable, or extraction chunks dropped), the pipeline must return
+    an explicit blocked/manual-review outcome — never a normal compliance memo.
+    This is generated with plain strings on purpose: a safety decision must not
+    depend on LLM availability. The memo begins with BLOCKED_PREFIX so the API
+    layer maps it to a blocked job status.
+    """
+    ref_number = audit_trail.get("reference_number", "MISSING-REF")
+    run_id = audit_trail.get("run_id", "unknown")
+    flagged = audit_trail.get("red_flags", [])
+
+    lines = [
+        BLOCKED_PREFIX,
+        "",
+        f"Reference Number: {ref_number}",
+        f"Run ID: {run_id}",
+        f"Generated: {datetime.now(tz=AEST).strftime('%Y-%m-%d %H:%M:%S %Z')}",
+        "",
+        "SUBJECT: ONBOARDING IS BLOCKED — AUTOMATED SCREENING COULD NOT BE COMPLETED",
+        "",
+        "This screening run did NOT complete. The following required checks were",
+        "unavailable, so the automated result must NOT be treated as a clearance.",
+        "",
+        "Incomplete reasons:",
+    ]
+    for reason in reasons:
+        lines.append(f"  - {reason}")
+
+    lines.extend(
+        [
+            "",
+            "Partial screening summary (already completed):",
+            f"  - Entities screened: {audit_trail.get('total_entities_checked', 0)}",
+            f"  - Red flags found so far: {len(flagged)}",
+            f"  - Sources used: {', '.join(audit_trail.get('screening_sources', []))}",
+            f"  - is_high_risk_flag: {audit_trail.get('is_high_risk_flag', False)}",
+            "",
+            "REQUIRED ACTION: Manual review by the Head of Risk before any factual",
+            "reliance is placed on this record. Do not approve onboarding, do not",
+            "issue a clearance, and do not submit an SMR based on this run alone.",
+            "",
+            "Compliance Officer: ____________________",
+        ]
+    )
+    return "\n".join(lines)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PIPELINE ORCHESTRATOR
 # Wires all four agents together with error handling, retry on Agent 2
@@ -1056,22 +1193,24 @@ def run_pipeline(
         except Exception as e:
             log.warning(f"Failed to check processing-key idempotency: {e}")
 
-    # ── PRIORITY 2: Open an observability record for this run ─────────────────
+    # ── PRIORITY 2 + SECURITY REVIEW: Claim the processing key ──────────────
+    # The pipeline_runs row doubles as a concurrency-safe claim on the processing
+    # key: PipelineRun.processing_key is UNIQUE, so two workers processing the
+    # same document race on this INSERT and exactly one wins. The loser returns
+    # immediately instead of duplicating the expensive (and never-reexpected)
+    # Agent 2 + Agent 3 work. This closes the review finding that idempotency
+    # was only enforced AFTER the work was done, at the final Trust insert.
     pipeline_run = None
     pipeline_started = None
     if db is not None:
         try:
-            from models import PipelineRun
             pipeline_started = datetime.now(AEST)
-            pipeline_run = PipelineRun(
-                run_id=run_id,
-                processing_key=processing_key,
-                abn=company_abn,
-                status="running",
-                started_at=pipeline_started,
+            pipeline_run, claim_skip_message = _claim_processing_key(
+                db, run_id, processing_key, company_abn, pipeline_started
             )
-            db.add(pipeline_run)
-            db.commit()
+            if claim_skip_message is not None:
+                log.info(f"Pipeline SKIPPED (concurrent claim): {claim_skip_message}")
+                return claim_skip_message
         except Exception as exc:
             db.rollback()
             log.warning(f"Pipeline: Could not open pipeline_runs record — {exc}")
@@ -1146,6 +1285,33 @@ def run_pipeline(
         pipeline_run.entity_count = audit_trail.get("total_entities_checked", 0)
         pipeline_run.red_flag_count = len(audit_trail.get("red_flags", []))
 
+    # ── SECURITY REVIEW: Incomplete screening → blocked outcome ──────────────
+    # A normal completed result must never be emitted when any required check was
+    # unavailable:
+    #   * PEP source unavailable   -> screening_incomplete=True (check_austrac_policy)
+    #   * extraction chunk dropped -> extraction_stats["failed_chunks"] > 0 (Agent 2)
+    incomplete_reasons: list[str] = []
+    failed_chunks = extraction_stats.get("failed_chunks", 0)
+    if audit_trail.get("screening_incomplete", False):
+        incomplete_reasons.append(
+            "PEP (Politically Exposed Persons) screening source was unavailable "
+            "(PEP API failed or unconfigured)"
+        )
+    if failed_chunks > 0:
+        incomplete_reasons.append(
+            f"{failed_chunks} extraction chunk(s) failed (chunks "
+            f"{extraction_stats.get('failed_chunk_indexes', [])}) — parties named "
+            "in those pages were never screened"
+        )
+    outcome_blocked = bool(incomplete_reasons)
+    if outcome_blocked:
+        audit_trail["screening_incomplete"] = True
+        audit_trail["incomplete_reasons"] = incomplete_reasons
+        log.error(
+            f"Pipeline: SCREENING INCOMPLETE — reasons: {incomplete_reasons}. "
+            "Emitting BLOCKED outcome."
+        )
+
     # FIX #7: Persist screening results (required for 7-year retention)
     try:
         s3.put_object(
@@ -1171,7 +1337,12 @@ def run_pipeline(
         ) from exc
 
     # ── AGENT 4: Draft Report ─────────────────────────────────────────────────
-    final_memo = generate_audit_report(audit_trail)
+    if outcome_blocked:
+        # SECURITY REVIEW: a blocked outcome is a safety decision — generated
+        # deterministically, never dependent on LLM availability.
+        final_memo = _build_blocked_memo(audit_trail, incomplete_reasons)
+    else:
+        final_memo = generate_audit_report(audit_trail)
 
     # FIX #7: Persist final compliance memo
     try:
@@ -1308,10 +1479,11 @@ def run_pipeline(
                 log.error(f"Pipeline: Failed to persist to relational database — {exc}")
                 raise RuntimeError("Database persistence failed; failing closed") from exc
 
-    # PRIORITY 2: Mark the run completed (durable, near-zero writes).
+    # PRIORITY 2: Mark the run terminal (completed OR blocked — never a normal
+    # completed state for an incomplete screen).
     if pipeline_run is not None and db is not None:
         try:
-            pipeline_run.status = "completed"
+            pipeline_run.status = "blocked" if outcome_blocked else "completed"
             pipeline_run.completed_at = datetime.now(AEST)
             if pipeline_started is not None:
                 pipeline_run.duration_ms = int(
@@ -1324,6 +1496,54 @@ def run_pipeline(
 
     log.info(f"Pipeline COMPLETE — Run ID {run_id}")
     return final_memo
+
+
+def _claim_processing_key(
+    db: Session,
+    run_id: str,
+    processing_key: Optional[str],
+    abn: str,
+    started_at,
+):
+    """
+    Atomically claims ``processing_key`` for this run.
+
+    SECURITY REVIEW (idempotency concurrency): ``PipelineRun.processing_key`` is
+    UNIQUE, so the INSERT is the claim/lease. Two workers processing the same
+    document race here; exactly one commits, the other hits IntegrityError and we
+    return a skip message. Official replay (Trust row already exists) is also
+    detected here to make the skip message accurate.
+
+    Returns ``(pipeline_run, None)`` on success, or ``(None, skip_message)`` if
+    the key was already claimed/processed. Never returns both.
+    """
+    from models import PipelineRun, Trust
+
+    pipeline_run = PipelineRun(
+        run_id=run_id,
+        processing_key=processing_key,
+        abn=abn,
+        status="running",
+        started_at=started_at,
+    )
+    db.add(pipeline_run)
+    try:
+        db.commit()
+        return pipeline_run, None
+    except IntegrityError:
+        db.rollback()
+        # Re-query after rollback: the competing worker may have finished the run
+        # between our SELECT above and this INSERT, in which case a Trust row now
+        # exists and we can report the official reference number.
+        if processing_key:
+            existing_trust = db.query(Trust).filter(Trust.processing_key == processing_key).first()
+            if existing_trust is not None:
+                return None, f"SKIPPED: Already processed under reference {existing_trust.reference_number}"
+        return (
+            None,
+            "SKIPPED: Processing already in progress for this document "
+            "(concurrent claim on this processing key is held by another run)",
+        )
 
 
 def _mark_pipeline_run_failed(

@@ -4,7 +4,7 @@ A 4-agent AI pipeline for **AML/KYC beneficial-ownership screening** of Australi
 
 - **Code:** [`hyvn-arsya/sovereign-aml-engine`](https://github.com/hyvn-arsya/sovereign-aml-engine)
 - **Stack:** Python · FastAPI · LangChain (LlamaParse, Gemini, Claude) · RapidFuzz · SQLAlchemy · AWS CDK · Docker
-- **Tests:** 28 pipeline/S3/data-model tests + 8 CDK unit tests, all green
+- **Tests:** 48 root tests + 8 CDK unit tests, all green
 
 ---
 
@@ -64,7 +64,7 @@ I wrote tests that confirm both the positive case (nicknames now caught) **and**
 
 ## Engineering rigor
 
-- **28 root tests** (14 pipeline unit + 3 moto S3 + 11 data-engineering), all passing, plus 8 CDK tests that synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn. The strip of the pipeline everyone worries about is the storage layer, so two of the suites put it under real test:
+- **48 root tests** (14 pipeline unit + 3 moto S3 + 18 data-engineering/security regressions + 12 API auth + 1 local mock), all passing, plus 8 CDK tests that synth the real stack and assert on the resulting CloudFormation — no snapshot-mock churn. The strip of the pipeline everyone worries about is the storage layer, so two of the suites put it under real test:
   - `test_moto_s3.py` runs the **real boto3 S3 code paths** (`gather_asic_data` and the audit-trail persistence in `run_pipeline`) against an in-process S3 mock — no AWS credentials or bucket needed. The same `put_object(..., ServerSideEncryption="aws:kms")` calls the pipeline makes in production execute for real against moto: the raw-upload path, the three audit artifacts (`extraction_output.json` / `screening_result.json` / `compliance_memo.txt`), and the KMS-at-rest encryption flag are all asserted. The external registry hop and the LLM agents are mocked; the S3 layer itself is what's under test.
   - `test_priorities.py` runs the **real `run_pipeline`** against moto S3 **plus an in-memory SQLite database** (only the LLM agents mocked). It proves the deterministic `processing_key` skips a re-screening of the same document *under a fresh `run_id`* while a genuinely new document reprocesses; that `pipeline_runs` captures `chunk_count` / `entity_count` / `red_flag_count` / `duration_ms`; and that the entity model persists `entities`, `entity_aliases`, and `screening_matches` tagged `direct` vs `alias_expansion`.
 - **Async job queue**: screening takes 20–40s, so a blocking HTTP request is a production smell. Added `POST /analyze/abn/async` (202 + job id) with `GET /jobs/{id}` polling; the worker is factored to run behind SQS/Fargate.
@@ -102,14 +102,26 @@ A screening pipeline that works end-to-end in a demo is not yet a defensible dat
 
 ---
 
+## Iteration: the security review (auth, fail-closed sources, blocked outcomes)
+
+A reviewer triaged the codebase and CDK into 7 findings, covering "the app has no auth", "demo DFAT/PEP seeds ship silently", "incomplete extraction reports success", "concurrent idempotency races", and IaC gaps (no Fargate→RDS network rule, no LLM-credential secret, audit bucket lacking Object Lock). All 7 are implemented with regression tests *and* CDK assertions rather than prose promises:
+
+- **Tenant-scoped API keys (the "no auth" review).** Every data endpoint now requires `X-Api-Key`; only `/health` stays public for the ALB probe. Keys map to a tenant, are stored as **salted SHA-256 hashes** (never plaintext), seed via `SEED_API_KEYS="tenant:key,..."`, and enforce borders on both axes — the tenant prefix owns uploaded S3 keys (cross-tenant S3 keys → 403) and job polling is tenant-scoped (cross-tenant job IDs → 404, not data leaks). 12 dedicated API tests cover 401/403/404 paths and blocked-status propagation.
+- **Fail-closed screening sources.** `SCREENING_MODE=production` refuses to screen unless `DFAT_SOURCE_URL` and `PEP_API_KEY` are configured — `load_dfat_sanctions`/`load_pep_list` raise instead of silently screening against demo seeds. Demo mode stays for development but is loud. Tests prove production refuses the mocks and demo defaults to them.
+- **Blocked outcome, not a false success.** The old code promised a "successful" screening even when a damaged document skipped chunks or PEP never loaded. Extraction now records per-chunk failures, and any incomplete screening resolves to a deterministic, LLM-independent outcome — job status `blocked`, memo `OUTCOME: BLOCKED — MANUAL REVIEW REQUIRED` — passed through the API as `status=blocked` on both sync and async paths. The screening decision is never laundered through the memo writer.
+- **Concurrency-safe idempotency.** The deterministic `processing_key` was previously enforced only by a `SELECT ... THEN SELECT` — two concurrent submissions could both pass the check and double-process. The column is now UNIQUE and the claim is a plain INSERT whose `IntegrityError` resolves to "this reference is already being/has been processed", so N concurrent duplicates converge on one run.
+- **IaC hardening (CDK assertions prove it).** An explicit security-group rule connects Fargate → RDS (previously the ALB was defined but the database was unreachable); LLM provider keys move to a Secrets Manager secret injected as ECS task secrets (placeholder value for the operator, never baked into the image); the audit bucket gets **Object Lock with a 7-year compliance-mode retention** plus S3-managed encryption — audit objects are immutable for their full AUSTRAC Part 11 retention window, and no policy (operator or API) can shorten it.
+
+---
+
 ## What I learned / would do next
 
 - **Deterministic-vs-generative is a right answer worth defending** — interviewers responded well to an explicit, documented trade-off rather than a default "LLM everything".
 - **Data sovereignty for Agents 2 & 4 — now built, not a promise.** "Sovereign AML" no longer has to send trust-deed PII to a foreign cloud by construction: the `LLMProvider` seam (see the iteration below) lets a bank run extraction and reporting on infrastructure it controls, while staying on Gemini/Claude by default. The self-hosted option is a working seam, not a roadmap claim.
-- **Production data source**: wire the real DFAT consolidated list and a commercial PEP provider, and back the alias table with a reference-data vendor (transliteration variants of non-English names are a bigger real-world risk than Anglo nicknames).
+- **Production data source**: `SCREENING_MODE=production` already refuses to screen without `DFAT_SOURCE_URL` and `PEP_API_KEY`, so wiring the real DFAT consolidated list and a commercial PEP provider is now a config change plus data-contract work — and the alias table should move to a reference-data vendor (transliteration variants of non-English names are a bigger real-world risk than Anglo nicknames).
 - **Truly async infra**: move the worker behind an SQS queue consumed by a separate Fargate task (the CDK stack is structured to accept it).
 - **Observability — now built, not a roadmap item.** Every run lands in `pipeline_runs` (`started_at`, `completed_at`, `status`, `chunk_count`, `entity_count`, `red_flag_count`, `duration_ms`), feeding the kind of spot-check query a reviewer actually writes: `SELECT AVG(duration_ms), AVG(entity_count), AVG(chunk_count), SUM(red_flag_count) FROM pipeline_runs WHERE status = 'completed'`.
-- **Idempotency claims stay honest.** The processing key buys idempotent replays, not exactly-once: a worker can still crash after pushing a memo downstream and before recording completion. I document that distinction in the README rather than papering over it — it's the difference between a defensible claim and one an interviewer can dismantle.
+- **Idempotency claims stay honest.** The processing key buys idempotent replays, not exactly-once — and *that* claim (a worker can still crash after pushing a memo downstream and before recording completion) is documented in the README rather than papered over. What *is* now DB-enforced: the claim itself. `processing_key` is UNIQUE and the claim is a `CREATE` whose `IntegrityError` resolves to a skip, so concurrent duplicates can't double-process in the gap between check and insert.
 
 ---
 

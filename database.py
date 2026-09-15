@@ -24,6 +24,11 @@ connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite")
 
 engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 
+
+def get_database_url() -> str:
+    """Shared URL for tools like Alembic so migrations target the same DB the app uses."""
+    return DATABASE_URL
+
 # 3. SessionLocal class
 # Each instance of the SessionLocal class will be a database session.
 # We disable autocommit and autoflush so we can manage transactions manually.

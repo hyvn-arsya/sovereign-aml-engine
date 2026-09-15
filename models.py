@@ -57,6 +57,33 @@ class ComplianceReport(Base):
     trust = relationship("Trust", back_populates="reports")
 
 
+class Tenant(Base):
+    """Tenant — identifies the API consumer that owns a job or key."""
+
+    __tablename__ = "tenants"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, nullable=False, index=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    api_keys = relationship("ApiKey", back_populates="tenant", cascade="all, delete-orphan")
+
+
+class ApiKey(Base):
+    """Stored API key (salted SHA-256 hash).  The plaintext is never persisted."""
+
+    __tablename__ = "api_keys"
+
+    id = Column(Integer, primary_key=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=False, index=True)
+    key_hash = Column(String, unique=True, nullable=False, index=True)
+    key_prefix = Column(String, nullable=False)  # first 8 chars of hex hash for display
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    tenant = relationship("Tenant", back_populates="api_keys")
+
+
 class AnalysisJob(Base):
     """Async screening job (Phase 3+: maps to an SQS/Fargate worker)."""
 
@@ -64,8 +91,9 @@ class AnalysisJob(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String, unique=True, index=True)
+    tenant_id = Column(Integer, ForeignKey("tenants.id"), nullable=True, index=True)
     abn = Column(String, index=True, nullable=False)
-    status = Column(String, index=True, default="queued")  # queued|running|completed|failed
+    status = Column(String, index=True, default="queued")  # queued|running|completed|failed|blocked
     compliance_memo = Column(Text, nullable=True)
     error = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -85,7 +113,7 @@ class PipelineRun(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(String, unique=True, index=True)
-    processing_key = Column(String, index=True)  # Deterministic processing identity
+    processing_key = Column(String, unique=True, index=True)  # Deterministic processing identity
     abn = Column(String, index=True, nullable=False)
     status = Column(String, index=True, default="running")  # running|completed|failed
     chunk_count = Column(Integer, default=0)
